@@ -4,15 +4,40 @@
   "outro_path": "",
   "intro_enabled": true,
   "outro_enabled": false,
-  "logo_path": "/Users/roman/Assets/TG - LOGO.png",
   "logo_enabled": true,
-  "logo_type": "image",
-  "logo_position": "top_right",
-  "logo_size": 12,
-  "logo_opacity": 0,
-  "logo_display": "full",
-  "logo_time_start": 0,
-  "logo_time_end": 10,
+  "logos": [
+    {
+      "path": "/Users/roman/Assets/TG - LOGO.png",
+      "type": "image",
+      "position": "top_left",
+      "size": 19,
+      "opacity": 100,
+      "display": "full",
+      "time_start": 0,
+      "time_end": 10
+    },
+    {
+      "path": "/Users/roman/Downloads/AyuGram Desktop/VK - LOGO.png",
+      "type": "image",
+      "position": "bottom_left",
+      "size": 15,
+      "opacity": 100,
+      "display": "full",
+      "time_start": 0,
+      "time_end": 10
+    },
+    {
+      "path": "/Users/roman/Downloads/AyuGram Desktop/AFRO18.mp4",
+      "type": "video_chromakey",
+      "position": "bottom_right",
+      "size": 15,
+      "opacity": 100,
+      "color": "Blue (0x0000FF)",
+      "display": "full",
+      "time_start": 0,
+      "time_end": 10
+    }
+  ],
   "resolution": "1280x720",
   "custom_resolution_w": 1920,
   "custom_resolution_h": 1080,

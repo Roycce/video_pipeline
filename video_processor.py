@@ -76,7 +76,6 @@ class VideoProcessor:
         # 2. Resolve intro / outro
         intro_path = self._resolve_asset(settings, "intro")
         outro_path = self._resolve_asset(settings, "outro")
-        logo_path = self._resolve_asset(settings, "logo")
 
         intro_dur = 0.0
         outro_dur = 0.0
@@ -141,7 +140,6 @@ class VideoProcessor:
                     settings=settings,
                     intro_path=intro_path,
                     outro_path=outro_path,
-                    logo_path=logo_path,
                     segment_duration=dur,
                     target_w=target_w,
                     target_h=target_h,
@@ -186,15 +184,27 @@ class VideoProcessor:
     ) -> list[tuple[float, float]]:
         """
         Return list of (start_sec, duration_sec) for each segment.
-        The last segment may be shorter.
+        If the last segment is shorter than segment_duration, its start
+        time is shifted backwards to overlap, ensuring all segments are
+        exactly segment_duration (unless total_duration < segment_duration).
         """
         if segment_duration <= 0:
             segment_duration = 960
+            
+        if total_duration <= segment_duration:
+            return [(0.0, total_duration)]
+            
         n = max(1, math.ceil(total_duration / segment_duration))
         segments = []
         for i in range(n):
             start = i * segment_duration
             dur = min(segment_duration, total_duration - start)
+            
+            # overlap last segment to make it exactly segment_duration
+            if i == n - 1 and dur < segment_duration:
+                start = max(0.0, total_duration - segment_duration)
+                dur = segment_duration
+                
             if dur > 0:
                 segments.append((start, dur))
         return segments

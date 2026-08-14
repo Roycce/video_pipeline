@@ -157,7 +157,6 @@ class FFmpegHandler:
         settings: dict,
         intro_path: str | None = None,
         outro_path: str | None = None,
-        logo_path: str | None = None,
         segment_duration: float = 960.0,
         target_w: int = 1920,
         target_h: int = 1080,
@@ -188,13 +187,22 @@ class FFmpegHandler:
             indices["outro"] = idx
             idx += 1
 
-        if logo_path:
-            inputs += ["-i", str(logo_path)]
-            indices["logo"] = idx
-            idx += 1
+        logos = []
+        if settings.get("logo_enabled", False):
+            logos = settings.get("logos", [])
+        
+        logo_indices = []
+        for logo in logos:
+            path = logo.get("path")
+            if path:
+                if logo.get("type") == "video_chromakey":
+                    inputs += ["-stream_loop", "-1"]
+                inputs += ["-i", str(path)]
+                logo_indices.append(idx)
+                idx += 1
 
         needs_concat = "intro" in indices or "outro" in indices
-        needs_logo = "logo" in indices
+        needs_logo = len(logo_indices) > 0
         needs_scale = settings.get("resolution", "source") != "source"
         needs_fps = target_fps is not None
         needs_filter = needs_concat or needs_logo or needs_scale or needs_fps
@@ -270,61 +278,79 @@ class FFmpegHandler:
 
         # ---- logo overlay ----
         if needs_logo:
-            li = indices["logo"]
-            logo_size_pct = settings.get("logo_size", 15) / 100.0
-            logo_opacity = settings.get("logo_opacity", 80) / 100.0
-            position = settings.get("logo_position", "top_right")
-            display = settings.get("logo_display", "full")
-
-            margin = 20
-            pos_map = {
-                "top_left": (str(margin), str(margin)),
-                "top_right": (f"W-w-{margin}", str(margin)),
-                "bottom_left": (str(margin), f"H-h-{margin}"),
-                "bottom_right": (f"W-w-{margin}", f"H-h-{margin}"),
-            }
-            ox, oy = pos_map.get(position, pos_map["top_right"])
-
-            # enable expression
-            enable = ""
-            if display == "first_n":
-                t = settings.get("logo_time_end", 10)
-                enable = f":enable='between(t,0,{t})'"
-            elif display == "last_n":
-                t = settings.get("logo_time_start", 10)
-                start_t = max(0, total_output_duration - t)
-                enable = f":enable='gte(t,{start_t:.1f})'"
-            elif display == "custom":
-                ts = settings.get("logo_time_start", 0)
-                te = settings.get("logo_time_end", 10)
-                enable = f":enable='between(t,{ts},{te})'"
-            # else "full" — no enable
-
-            logo_w = max(32, int(target_w * logo_size_pct))
-
-            if settings.get("logo_type") == "video_chromakey":
-                filters.append(
-                    f"[{li}:v]colorkey=0x00FF00:0.3:0.15,format=rgba,"
-                    f"scale={logo_w}:-1,"
-                    f"colorchannelmixer=aa={logo_opacity:.2f}[logo]"
-                )
-            else:
-                # image with transparency
-                filters.append(
-                    f"[{li}:v]format=rgba,"
-                    f"scale={logo_w}:-1,"
-                    f"colorchannelmixer=aa={logo_opacity:.2f}[logo]"
-                )
-
-            # if video_out is a direct reference, wrap it with null
+            # if video_out is a direct reference, wrap it with null so we can chain
             if ":" in video_out:
                 filters.append(f"[{video_out}]null[vbase]")
                 video_out = "vbase"
 
-            filters.append(
-                f"[{video_out}][logo]overlay={ox}:{oy}{enable},format=yuv420p[outv]"
-            )
-            video_out = "outv"
+            for i, (logo, li) in enumerate(zip(logos, logo_indices)):
+                if not logo.get("path"):
+                    continue
+                    
+                logo_size_pct = logo.get("size", 15) / 100.0
+                logo_opacity = logo.get("opacity", 80) / 100.0
+                position = logo.get("position", "top_right")
+                display = logo.get("display", "full")
+
+                margin = 20
+                pos_map = {
+                    "top_left": (str(margin), str(margin)),
+                    "top_right": (f"W-w-{margin}", str(margin)),
+                    "bottom_left": (str(margin), f"H-h-{margin}"),
+                    "bottom_right": (f"W-w-{margin}", f"H-h-{margin}"),
+                    "center": (f"(W-w)/2", f"(H-h)/2"),
+                }
+                ox, oy = pos_map.get(position, pos_map["top_right"])
+
+                # enable expression
+                enable = ""
+                if display == "first_n":
+                    t = logo.get("time_end", 10)
+                    enable = f":enable='between(t,0,{t})'"
+                elif display == "last_n":
+                    t = logo.get("time_start", 10)
+                    start_t = max(0, total_output_duration - t)
+                    enable = f":enable='gte(t,{start_t:.1f})'"
+                elif display == "custom":
+                    ts = logo.get("time_start", 0)
+                    te = logo.get("time_end", 10)
+                    enable = f":enable='between(t,{ts},{te})'"
+
+                logo_w = max(32, int(target_w * logo_size_pct))
+                logo_lbl = f"logo{i}"
+                
+                angle = logo.get("angle", 0)
+                rotate_filter = f"rotate={angle}*PI/180:c=none," if angle != 0 else ""
+
+                if logo.get("type") == "video_chromakey":
+                    color_str = logo.get("color", "Green")
+                    if "Blue" in color_str:
+                        ckey = "0x0000FF"
+                    elif "Black" in color_str:
+                        ckey = "0x000000"
+                    else:
+                        ckey = "0x00FF00"
+                        
+                    filters.append(
+                        f"[{li}:v]colorkey={ckey}:0.3:0.15,format=rgba,"
+                        f"scale={logo_w}:-1,{rotate_filter}"
+                        f"colorchannelmixer=aa={logo_opacity:.2f}[{logo_lbl}]"
+                    )
+                else:
+                    filters.append(
+                        f"[{li}:v]format=rgba,"
+                        f"scale={logo_w}:-1,{rotate_filter}"
+                        f"colorchannelmixer=aa={logo_opacity:.2f}[{logo_lbl}]"
+                    )
+
+                next_out = f"outv{i}"
+                is_last = (i == len(logo_indices) - 1)
+                fmt = ",format=yuv420p" if is_last else ""
+                
+                filters.append(
+                    f"[{video_out}][{logo_lbl}]overlay={ox}:{oy}:eof_action=pass{enable}{fmt}[{next_out}]"
+                )
+                video_out = next_out
         else:
             # no logo, but we might still need to ensure yuv420p if other filters were used
             if ":" not in video_out:

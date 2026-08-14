@@ -19,15 +19,9 @@ DEFAULT_SETTINGS = {
     "outro_enabled": False,
 
     # --- Logo ---
-    "logo_path": "",
     "logo_enabled": False,
-    "logo_type": "image",               # image, video_chromakey
-    "logo_position": "top_right",       # top_left, top_right, bottom_left, bottom_right
-    "logo_size": 15,                    # percent of video width (5–50)
-    "logo_opacity": 80,                 # percent (0–100)
-    "logo_display": "full",             # full, first_n, last_n, custom
-    "logo_time_start": 0,               # seconds
-    "logo_time_end": 10,                # seconds
+    "logos": [],                        # List of logo dicts
+
 
     # --- Video ---
     "resolution": "source",             # "source", "1280x720", "1920x1080", etc.

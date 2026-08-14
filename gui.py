@@ -14,13 +14,156 @@ from PySide6.QtWidgets import (
     QTabWidget, QGroupBox, QLabel, QComboBox, QSpinBox,
     QPushButton, QCheckBox, QSlider, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QTextEdit, QProgressBar, QMessageBox,
-    QSplitter
+    QSplitter, QDialog, QDialogButtonBox, QListWidget
 )
 
 from queue_manager import QueueManager, TaskStatus
 from settings import Settings
 from profiles import ProfileManager
 
+
+
+class LogoEditDialog(QDialog):
+    def __init__(self, parent=None, logo_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройка логотипа")
+        self.setMinimumWidth(400)
+        self.logo_data = logo_data or {
+            "path": "",
+            "type": "image",
+            "position": "top_right",
+            "size": 15,
+            "opacity": 80,
+            "angle": 0,
+            "color": "Green (0x00FF00)",
+            "display": "full",
+            "time_start": 0,
+            "time_end": 10
+        }
+        self._init_ui()
+        self._load_data()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        h_type = QHBoxLayout()
+        h_type.addWidget(QLabel("Тип:"))
+        self.cb_type = QComboBox()
+        self.cb_type.addItems(["image", "video_chromakey"])
+        self.cb_type.currentIndexChanged.connect(self._on_type_changed)
+        h_type.addWidget(self.cb_type)
+        layout.addLayout(h_type)
+
+        self.w_color = QWidget()
+        h_color = QHBoxLayout(self.w_color)
+        h_color.setContentsMargins(0,0,0,0)
+        h_color.addWidget(QLabel("Цвет фона (Chromakey):"))
+        self.cb_color = QComboBox()
+        self.cb_color.addItems(["Green (0x00FF00)", "Blue (0x0000FF)", "Black (0x000000)"])
+        h_color.addWidget(self.cb_color)
+        layout.addWidget(self.w_color)
+
+        h_path = QHBoxLayout()
+        self.lbl_path = QLabel("Путь не выбран")
+        btn_browse = QPushButton("Обзор...")
+        btn_browse.clicked.connect(self._browse)
+        h_path.addWidget(self.lbl_path, stretch=1)
+        h_path.addWidget(btn_browse)
+        layout.addLayout(h_path)
+
+        h_pos = QHBoxLayout()
+        h_pos.addWidget(QLabel("Позиция:"))
+        self.cb_pos = QComboBox()
+        self.cb_pos.addItems(["top_left", "top_right", "bottom_left", "bottom_right", "center"])
+        h_pos.addWidget(self.cb_pos)
+        layout.addLayout(h_pos)
+
+        h_size = QHBoxLayout()
+        h_size.addWidget(QLabel("Размер (%):"))
+        self.spin_size = QSpinBox()
+        self.spin_size.setRange(5, 50)
+        h_size.addWidget(self.spin_size)
+        layout.addLayout(h_size)
+
+        h_op = QHBoxLayout()
+        h_op.addWidget(QLabel("Прозрачность (%):"))
+        self.spin_op = QSpinBox()
+        self.spin_op.setRange(0, 100)
+        h_op.addWidget(self.spin_op)
+        layout.addLayout(h_op)
+
+        h_angle = QHBoxLayout()
+        h_angle.addWidget(QLabel("Угол наклона (град):"))
+        self.spin_angle = QSpinBox()
+        self.spin_angle.setRange(-360, 360)
+        h_angle.addWidget(self.spin_angle)
+        layout.addLayout(h_angle)
+
+        h_time = QHBoxLayout()
+        h_time.addWidget(QLabel("Показ:"))
+        self.cb_time = QComboBox()
+        self.cb_time.addItems(["full", "first_n", "last_n", "custom"])
+        self.cb_time.currentIndexChanged.connect(self._on_time_changed)
+        h_time.addWidget(self.cb_time)
+        layout.addLayout(h_time)
+
+        self.w_times = QWidget()
+        lt = QHBoxLayout(self.w_times)
+        lt.setContentsMargins(0,0,0,0)
+        lt.addWidget(QLabel("От:"))
+        self.spin_tstart = QSpinBox()
+        self.spin_tstart.setRange(0, 3600)
+        lt.addWidget(self.spin_tstart)
+        lt.addWidget(QLabel("До:"))
+        self.spin_tend = QSpinBox()
+        self.spin_tend.setRange(0, 3600)
+        lt.addWidget(self.spin_tend)
+        self.w_times.setVisible(False)
+        layout.addWidget(self.w_times)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _browse(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Выбрать логотип", "", "Media (*.png *.jpg *.jpeg *.mp4 *.mov)")
+        if f:
+            self.lbl_path.setText(f)
+
+    def _on_time_changed(self):
+        self.w_times.setVisible(self.cb_time.currentText() != "full")
+        
+    def _on_type_changed(self):
+        self.w_color.setVisible(self.cb_type.currentText() == "video_chromakey")
+
+    def _load_data(self):
+        self.cb_type.setCurrentText(self.logo_data.get("type", "image"))
+        self.lbl_path.setText(self.logo_data.get("path", "Путь не выбран") or "Путь не выбран")
+        self.cb_pos.setCurrentText(self.logo_data.get("position", "top_right"))
+        self.spin_size.setValue(self.logo_data.get("size", 15))
+        self.spin_op.setValue(self.logo_data.get("opacity", 80))
+        self.spin_angle.setValue(self.logo_data.get("angle", 0))
+        self.cb_color.setCurrentText(self.logo_data.get("color", "Green (0x00FF00)"))
+        self.cb_time.setCurrentText(self.logo_data.get("display", "full"))
+        self.spin_tstart.setValue(self.logo_data.get("time_start", 0))
+        self.spin_tend.setValue(self.logo_data.get("time_end", 10))
+        self._on_time_changed()
+        self._on_type_changed()
+
+    def get_data(self):
+        return {
+            "path": self.lbl_path.text() if self.lbl_path.text() != "Путь не выбран" else "",
+            "type": self.cb_type.currentText(),
+            "position": self.cb_pos.currentText(),
+            "size": self.spin_size.value(),
+            "opacity": self.spin_op.value(),
+            "angle": self.spin_angle.value(),
+            "color": self.cb_color.currentText(),
+            "display": self.cb_time.currentText(),
+            "time_start": self.spin_tstart.value(),
+            "time_end": self.spin_tend.value()
+        }
 
 class MainWindow(QMainWindow):
     def __init__(self, settings: Settings, profiles: ProfileManager):
@@ -236,86 +379,67 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
+
     def _create_logo_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        self.chk_logo = QCheckBox("Включить логотип")
+        self.chk_logo = QCheckBox("Включить наложение логотипов")
         layout.addWidget(self.chk_logo)
         
-        h_type = QHBoxLayout()
-        h_type.addWidget(QLabel("Тип логотипа:"))
-        self.cb_logo_type = QComboBox()
-        self.cb_logo_type.addItems(["Обычная картинка (PNG/JPG)", "Видео (Green Screen)"])
-        h_type.addWidget(self.cb_logo_type)
-        h_type.addStretch()
-        layout.addLayout(h_type)
+        self.list_logos = QListWidget()
+        layout.addWidget(self.list_logos)
         
-        h_path = QHBoxLayout()
-        self.lbl_logo_path = QLabel("Путь не выбран")
-        btn_logo_browse = QPushButton("Обзор...")
-        btn_logo_browse.clicked.connect(self._browse_logo)
-        h_path.addWidget(self.lbl_logo_path, stretch=1)
-        h_path.addWidget(btn_logo_browse)
-        layout.addLayout(h_path)
+        h_btns = QHBoxLayout()
+        btn_add = QPushButton("Добавить логотип")
+        btn_add.clicked.connect(self._action_add_logo)
+        h_btns.addWidget(btn_add)
         
-        # Position
-        h_pos = QHBoxLayout()
-        h_pos.addWidget(QLabel("Позиция:"))
-        self.cb_logo_pos = QComboBox()
-        self.cb_logo_pos.addItems(["top_left", "top_right", "bottom_left", "bottom_right"])
-        h_pos.addWidget(self.cb_logo_pos)
-        h_pos.addStretch()
-        layout.addLayout(h_pos)
+        btn_edit = QPushButton("Изменить")
+        btn_edit.clicked.connect(self._action_edit_logo)
+        h_btns.addWidget(btn_edit)
         
-        # Size
-        h_size = QHBoxLayout()
-        h_size.addWidget(QLabel("Размер (%):"))
-        self.slider_logo_size = QSlider(Qt.Orientation.Horizontal)
-        self.slider_logo_size.setRange(5, 50)
-        self.lbl_logo_size_val = QLabel("15%")
-        self.slider_logo_size.valueChanged.connect(lambda v: self.lbl_logo_size_val.setText(f"{v}%"))
-        h_size.addWidget(self.slider_logo_size)
-        h_size.addWidget(self.lbl_logo_size_val)
-        layout.addLayout(h_size)
+        btn_remove = QPushButton("Удалить")
+        btn_remove.clicked.connect(self._action_remove_logo)
+        h_btns.addWidget(btn_remove)
         
-        # Opacity
-        h_op = QHBoxLayout()
-        h_op.addWidget(QLabel("Прозрачность (%):"))
-        self.slider_logo_opacity = QSlider(Qt.Orientation.Horizontal)
-        self.slider_logo_opacity.setRange(0, 100)
-        self.lbl_logo_opacity_val = QLabel("80%")
-        self.slider_logo_opacity.valueChanged.connect(lambda v: self.lbl_logo_opacity_val.setText(f"{v}%"))
-        h_op.addWidget(self.slider_logo_opacity)
-        h_op.addWidget(self.lbl_logo_opacity_val)
-        layout.addLayout(h_op)
+        layout.addLayout(h_btns)
         
-        # Display Time
-        h_time = QHBoxLayout()
-        h_time.addWidget(QLabel("Время показа:"))
-        self.cb_logo_time = QComboBox()
-        self.cb_logo_time.addItems(["full", "first_n", "last_n", "custom"])
-        self.cb_logo_time.currentIndexChanged.connect(self._on_logo_time_changed)
-        h_time.addWidget(self.cb_logo_time)
-        layout.addLayout(h_time)
+        # Save reference for internal list of dicts
+        self._logos_data = []
         
-        self.w_logo_times = QWidget()
-        lt = QHBoxLayout(self.w_logo_times)
-        lt.setContentsMargins(0, 0, 0, 0)
-        lt.addWidget(QLabel("От (сек):"))
-        self.spin_logo_start = QSpinBox()
-        self.spin_logo_start.setRange(0, 3600)
-        lt.addWidget(self.spin_logo_start)
-        lt.addWidget(QLabel("До (сек):"))
-        self.spin_logo_end = QSpinBox()
-        self.spin_logo_end.setRange(0, 3600)
-        lt.addWidget(self.spin_logo_end)
-        lt.addStretch()
-        self.w_logo_times.setVisible(False)
-        layout.addWidget(self.w_logo_times)
-        
-        layout.addStretch()
         return widget
+
+    def _refresh_logos_list(self):
+        self.list_logos.clear()
+        for i, ld in enumerate(self._logos_data):
+            p = ld.get("path", "")
+            name = Path(p).name if p else "Не выбран"
+            pos = ld.get("position", "")
+            self.list_logos.addItem(f"{i+1}. {name} [{pos}]")
+
+    def _action_add_logo(self):
+        dlg = LogoEditDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._logos_data.append(dlg.get_data())
+            self._refresh_logos_list()
+            self._save_ui_to_settings()
+
+    def _action_edit_logo(self):
+        r = self.list_logos.currentRow()
+        if r < 0 or r >= len(self._logos_data): return
+        dlg = LogoEditDialog(self, self._logos_data[r])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._logos_data[r] = dlg.get_data()
+            self._refresh_logos_list()
+            self._save_ui_to_settings()
+
+    def _action_remove_logo(self):
+        r = self.list_logos.currentRow()
+        if r >= 0 and r < len(self._logos_data):
+            del self._logos_data[r]
+            self._refresh_logos_list()
+            self._save_ui_to_settings()
 
     def _create_video_tab(self) -> QWidget:
         widget = QWidget()
@@ -520,20 +644,8 @@ class MainWindow(QMainWindow):
         
         # Logo
         self.chk_logo.setChecked(s.get("logo_enabled", False))
-        
-        l_type = s.get("logo_type", "image")
-        if l_type == "video_chromakey":
-            self.cb_logo_type.setCurrentIndex(1)
-        else:
-            self.cb_logo_type.setCurrentIndex(0)
-            
-        self.lbl_logo_path.setText(s.get("logo_path", "Путь не выбран") or "Путь не выбран")
-        self.cb_logo_pos.setCurrentText(s.get("logo_position", "top_right"))
-        self.slider_logo_size.setValue(s.get("logo_size", 15))
-        self.slider_logo_opacity.setValue(s.get("logo_opacity", 80))
-        self.cb_logo_time.setCurrentText(s.get("logo_display", "full"))
-        self.spin_logo_start.setValue(s.get("logo_time_start", 0))
-        self.spin_logo_end.setValue(s.get("logo_time_end", 10))
+        self._logos_data = s.get("logos", [])
+        self._refresh_logos_list()
         
         # Video
         self.cb_res.setCurrentText(s.get("resolution", "source"))
@@ -570,13 +682,7 @@ class MainWindow(QMainWindow):
         
         # Logo
         s.set("logo_enabled", self.chk_logo.isChecked())
-        s.set("logo_type", "video_chromakey" if self.cb_logo_type.currentIndex() == 1 else "image")
-        s.set("logo_position", self.cb_logo_pos.currentText())
-        s.set("logo_size", self.slider_logo_size.value())
-        s.set("logo_opacity", self.slider_logo_opacity.value())
-        s.set("logo_display", self.cb_logo_time.currentText())
-        s.set("logo_time_start", self.spin_logo_start.value())
-        s.set("logo_time_end", self.spin_logo_end.value())
+        s.set("logos", self._logos_data)
         
         # Video
         s.set("resolution", self.cb_res.currentText())
@@ -599,13 +705,7 @@ class MainWindow(QMainWindow):
         self.chk_outro.toggled.connect(self._save_ui_to_settings)
         
         self.chk_logo.toggled.connect(self._save_ui_to_settings)
-        self.cb_logo_type.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.cb_logo_pos.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.slider_logo_size.valueChanged.connect(self._save_ui_to_settings)
-        self.slider_logo_opacity.valueChanged.connect(self._save_ui_to_settings)
-        self.cb_logo_time.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.spin_logo_start.valueChanged.connect(self._save_ui_to_settings)
-        self.spin_logo_end.valueChanged.connect(self._save_ui_to_settings)
+
         
         self.cb_res.currentIndexChanged.connect(self._save_ui_to_settings)
         self.spin_res_w.valueChanged.connect(self._save_ui_to_settings)
