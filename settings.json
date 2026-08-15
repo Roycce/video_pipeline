@@ -1,6 +1,6 @@
 {
   "segment_duration_min": 16,
-  "intro_path": "/Users/roman/Assets/Intro - PRIVATE.mp4",
+  "intro_path": "/Users/roman/Downloads/AyuGram Desktop/Intro - PRIVATE.mp4",
   "outro_path": "",
   "intro_enabled": true,
   "outro_enabled": false,
@@ -27,12 +27,13 @@
       "time_end": 10
     },
     {
-      "path": "/Users/roman/Downloads/AyuGram Desktop/AFRO18.mp4",
-      "type": "video_chromakey",
-      "position": "bottom_right",
-      "size": 15,
-      "opacity": 100,
-      "color": "Blue (0x0000FF)",
+      "path": "/Users/roman/Downloads/AyuGram Desktop/LOGO - ZV.png",
+      "type": "image",
+      "position": "center",
+      "size": 30,
+      "opacity": 80,
+      "angle": 30,
+      "color": "Green (0x00FF00)",
       "display": "full",
       "time_start": 0,
       "time_end": 10

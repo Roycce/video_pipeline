@@ -197,6 +197,9 @@ class FFmpegHandler:
             if path:
                 if logo.get("type") == "video_chromakey":
                     inputs += ["-stream_loop", "-1"]
+                else:
+                    # image logo: loop it infinitely so it covers the whole video
+                    inputs += ["-loop", "1"]
                 inputs += ["-i", str(path)]
                 logo_indices.append(idx)
                 idx += 1
