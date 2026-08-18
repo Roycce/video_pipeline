@@ -41,8 +41,12 @@ def main():
     # Initialize application
     app = QApplication(sys.argv)
     
-    # Load settings and profiles from the same directory as main.py
-    base_dir = Path(__file__).parent.absolute()
+    # Load settings and profiles from the same directory as main.py or executable
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys.executable).parent.absolute()
+    else:
+        base_dir = Path(__file__).parent.absolute()
+
     settings_path = base_dir / "settings.json"
     profiles_path = base_dir / "profiles.json"
     

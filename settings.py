@@ -6,6 +6,7 @@ Settings are stored in a JSON file next to the application.
 """
 
 import json
+import sys
 from pathlib import Path
 
 DEFAULT_SETTINGS = {
@@ -45,7 +46,10 @@ class Settings:
 
     def __init__(self, config_path: str | Path | None = None):
         if config_path is None:
-            config_path = Path(__file__).parent / "settings.json"
+            if getattr(sys, 'frozen', False):
+                config_path = Path(sys.executable).parent / "settings.json"
+            else:
+                config_path = Path(__file__).parent / "settings.json"
         self._path = Path(config_path)
         self._data: dict = dict(DEFAULT_SETTINGS)
         self.load()
