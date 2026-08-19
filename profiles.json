@@ -1,0 +1,51 @@
+{
+  "main": {
+    "segment_duration_min": 16,
+    "intro_path": "/Users/roman/Assets/Intro - PRIVATE.mp4",
+    "outro_path": "",
+    "intro_enabled": true,
+    "outro_enabled": false,
+    "logo_enabled": true,
+    "logos": [
+      {
+        "path": "/Users/roman/Assets/TG - LOGO.png",
+        "type": "image",
+        "position": "top_left",
+        "size": 19,
+        "opacity": 100,
+        "display": "full",
+        "time_start": 0,
+        "time_end": 10
+      },
+      {
+        "path": "/Users/roman/Downloads/AyuGram Desktop/VK - LOGO.png",
+        "type": "image",
+        "position": "bottom_left",
+        "size": 15,
+        "opacity": 100,
+        "display": "full",
+        "time_start": 0,
+        "time_end": 10
+      },
+      {
+        "path": "/Users/roman/Downloads/AyuGram Desktop/AFRO18.mp4",
+        "type": "video_chromakey",
+        "position": "center",
+        "size": 15,
+        "opacity": 100,
+        "display": "full",
+        "time_start": 0,
+        "time_end": 10
+      }
+    ],
+    "resolution": "1280x720",
+    "custom_resolution_w": 1920,
+    "custom_resolution_h": 1080,
+    "fps": "30",
+    "codec": "hevc_videotoolbox",
+    "file_size_limit_enabled": false,
+    "file_size_limit_mb": 650,
+    "audio_bitrate": 192,
+    "output_subfolder": "output"
+  }
+}

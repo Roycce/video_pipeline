@@ -1,10 +1,9 @@
-name: Build Executable
+name: Build & Release
 
 on:
   push:
-    branches:
-      - main
-      - master
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -30,8 +29,29 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name StreamAutoCutter main.py
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: StreamAutoCutter-Windows
-          path: dist/StreamAutoCutter.exe
+          tag_name: ${{ github.ref_name }}
+          name: Stream Auto Cutter ${{ github.ref_name }}
+          body: |
+            ## Stream Auto Cutter ${{ github.ref_name }}
+
+            ### Что нового в 1.0.2
+            - Добавлена вкладка **ВКонтакте** — загрузка готовых видео прямо из программы
+            - Поддержка загрузки на личную страницу и в группу
+            - Файл с названиями (titles.txt) — одно название на строку
+            - Настройки паузы между загрузками и лимита за сессию
+            - Токен и настройки сохраняются между запусками
+
+            ### Установка
+            1. Скачай `StreamAutoCutter.exe`
+            2. Положи рядом `ffmpeg.exe` и `ffprobe.exe`
+            3. Запускай
+
+            > Требует Windows 10/11 x64
+          files: dist/StreamAutoCutter.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
