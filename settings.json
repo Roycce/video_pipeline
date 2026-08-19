@@ -12,9 +12,11 @@
       "position": "top_left",
       "size": 19,
       "opacity": 100,
-      "display": "full",
-      "time_start": 0,
-      "time_end": 10
+      "angle": 0,
+      "color": "Green (0x00FF00)",
+      "display": "last_n",
+      "time_start": 1,
+      "time_end": 16
     },
     {
       "path": "/Users/roman/Downloads/AyuGram Desktop/VK - LOGO.png",
@@ -22,9 +24,11 @@
       "position": "bottom_left",
       "size": 15,
       "opacity": 100,
-      "display": "full",
-      "time_start": 0,
-      "time_end": 10
+      "angle": 0,
+      "color": "Green (0x00FF00)",
+      "display": "custom",
+      "time_start": 1,
+      "time_end": 16
     },
     {
       "path": "/Users/roman/Downloads/AyuGram Desktop/LOGO - ZV.png",
@@ -34,9 +38,9 @@
       "opacity": 80,
       "angle": 30,
       "color": "Green (0x00FF00)",
-      "display": "full",
-      "time_start": 0,
-      "time_end": 10
+      "display": "custom",
+      "time_start": 1,
+      "time_end": 16
     }
   ],
   "resolution": "1280x720",
@@ -47,5 +51,11 @@
   "file_size_limit_enabled": false,
   "file_size_limit_mb": 650,
   "audio_bitrate": 192,
-  "output_subfolder": "output"
+  "output_subfolder": "output",
+  "vk_token": "vk1.a.JX8sLxTsqQN2iKlszfxdvCNpKiqrxyeprwk7u5WvoLPgeMwmD8uqKcIUOTA7_ODZIUrPinFSmwIvb21LVQbF6B-K7TruKWYAunM2sHf30jRv_aE_OZBikEfDEYVDWRKBtzpibOe_vk8vWK9GPQisBPIXmC74AyuzoSzngnaA1ywe_jhoAbQfM_CNlnFOudUeK9JdCWstmqYlSRrBAE359g",
+  "vk_group_id": "238838238",
+  "vk_titles_file": "/Users/roman/Documents/titles.txt",
+  "vk_video_folder": "/Users/roman/Downloads/VK-Dzen/VK Video/output/",
+  "vk_delay_sec": 10,
+  "vk_max_videos": 150
 }

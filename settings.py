@@ -38,6 +38,14 @@ DEFAULT_SETTINGS = {
 
     # --- Output ---
     "output_subfolder": "output",
+
+    # --- VK Uploader ---
+    "vk_token": "",
+    "vk_group_id": "",           # пустая строка = личная страница
+    "vk_titles_file": "",        # путь к файлу с названиями
+    "vk_video_folder": "",       # папка с готовыми видео
+    "vk_delay_sec": 10,
+    "vk_max_videos": 150,
 }
 
 

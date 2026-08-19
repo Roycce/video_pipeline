@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
     QTabWidget, QGroupBox, QLabel, QComboBox, QSpinBox,
     QPushButton, QCheckBox, QSlider, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QTextEdit, QProgressBar, QMessageBox,
-    QSplitter, QDialog, QDialogButtonBox, QListWidget
+    QSplitter, QDialog, QDialogButtonBox, QListWidget, QLineEdit
 )
+
+from vk_uploader import VkUploader
 
 from queue_manager import QueueManager, TaskStatus
 from settings import Settings
@@ -252,6 +254,7 @@ class MainWindow(QMainWindow):
         self.tab_video = self._create_video_tab()
         self.tab_size = self._create_size_tab()
         self.tab_profiles = self._create_profiles_tab()
+        self.tab_vk = self._create_vk_tab()
         
         self.tabs.addTab(self.tab_cut, "Нарезка")
         self.tabs.addTab(self.tab_io, "Интро/Аутро")
@@ -259,6 +262,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_video, "Видео")
         self.tabs.addTab(self.tab_size, "Размер")
         self.tabs.addTab(self.tab_profiles, "Профили")
+        self.tabs.addTab(self.tab_vk, "ВКонтакте")
+
+        # VK uploader worker
+        self._vk_uploader: VkUploader | None = None
         
         right_layout.addWidget(self.tabs)
         splitter.addWidget(right_panel)
@@ -552,6 +559,106 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
+    def _create_vk_tab(self) -> QWidget:
+        """Вкладка загрузки видео в ВКонтакте."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(8)
+
+        # --- Авторизация ---
+        auth_group = QGroupBox("Авторизация")
+        auth_layout = QVBoxLayout(auth_group)
+
+        h_token = QHBoxLayout()
+        h_token.addWidget(QLabel("Токен ВК:"))
+        self.vk_token_edit = QLineEdit()
+        self.vk_token_edit.setPlaceholderText("vk1.a.xxxxxxxxxxxx...")
+        self.vk_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        h_token.addWidget(self.vk_token_edit, stretch=1)
+        auth_layout.addLayout(h_token)
+
+        h_group = QHBoxLayout()
+        h_group.addWidget(QLabel("ID группы (пусто = личная страница):"))
+        self.vk_group_edit = QLineEdit()
+        self.vk_group_edit.setPlaceholderText("123456789")
+        h_group.addWidget(self.vk_group_edit, stretch=1)
+        auth_layout.addLayout(h_group)
+
+        layout.addWidget(auth_group)
+
+        # --- Источник видео ---
+        src_group = QGroupBox("Исходные файлы")
+        src_layout = QVBoxLayout(src_group)
+
+        h_folder = QHBoxLayout()
+        h_folder.addWidget(QLabel("Папка с видео:"))
+        self.vk_folder_lbl = QLabel("Не выбрана")
+        self.vk_folder_lbl.setWordWrap(True)
+        btn_folder = QPushButton("Обзор...")
+        btn_folder.clicked.connect(self._vk_browse_folder)
+        h_folder.addWidget(self.vk_folder_lbl, stretch=1)
+        h_folder.addWidget(btn_folder)
+        src_layout.addLayout(h_folder)
+
+        h_titles = QHBoxLayout()
+        h_titles.addWidget(QLabel("Файл с названиями:"))
+        self.vk_titles_lbl = QLabel("Не выбран")
+        self.vk_titles_lbl.setWordWrap(True)
+        btn_titles = QPushButton("Обзор...")
+        btn_titles.clicked.connect(self._vk_browse_titles)
+        h_titles.addWidget(self.vk_titles_lbl, stretch=1)
+        h_titles.addWidget(btn_titles)
+        src_layout.addLayout(h_titles)
+
+        layout.addWidget(src_group)
+
+        # --- Параметры загрузки ---
+        params_group = QGroupBox("Параметры")
+        params_layout = QHBoxLayout(params_group)
+
+        params_layout.addWidget(QLabel("Пауза (сек):"))
+        self.vk_delay_spin = QSpinBox()
+        self.vk_delay_spin.setRange(1, 300)
+        self.vk_delay_spin.setValue(10)
+        params_layout.addWidget(self.vk_delay_spin)
+
+        params_layout.addSpacing(20)
+        params_layout.addWidget(QLabel("Макс. видео за сессию:"))
+        self.vk_max_spin = QSpinBox()
+        self.vk_max_spin.setRange(1, 1000)
+        self.vk_max_spin.setValue(150)
+        params_layout.addWidget(self.vk_max_spin)
+        params_layout.addStretch()
+
+        layout.addWidget(params_group)
+
+        # --- Управление ---
+        ctrl_layout = QHBoxLayout()
+        self.vk_btn_start = QPushButton("▶ Загрузить в ВК")
+        self.vk_btn_start.setMinimumHeight(36)
+        self.vk_btn_start.clicked.connect(self.action_vk_start)
+        self.vk_btn_stop = QPushButton("⏹ Остановить")
+        self.vk_btn_stop.setMinimumHeight(36)
+        self.vk_btn_stop.setEnabled(False)
+        self.vk_btn_stop.clicked.connect(self.action_vk_stop)
+        ctrl_layout.addWidget(self.vk_btn_start)
+        ctrl_layout.addWidget(self.vk_btn_stop)
+        layout.addLayout(ctrl_layout)
+
+        # --- Прогресс ---
+        self.vk_progress = QProgressBar()
+        self.vk_progress.setTextVisible(True)
+        self.vk_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.vk_progress.setFormat("Файл %v из %m")
+        layout.addWidget(self.vk_progress)
+
+        # --- Лог ---
+        self.vk_log = QTextEdit()
+        self.vk_log.setReadOnly(True)
+        layout.addWidget(self.vk_log, stretch=1)
+
+        return widget
+
     def apply_theme(self):
         self.setStyleSheet("""
             QMainWindow, QWidget {
@@ -665,6 +772,14 @@ class MainWindow(QMainWindow):
         self.spin_size_mb.setValue(s.get("file_size_limit_mb", 650))
         self.spin_audio_kbps.setValue(s.get("audio_bitrate", 128))
 
+        # VK
+        self.vk_token_edit.setText(s.get("vk_token", ""))
+        self.vk_group_edit.setText(s.get("vk_group_id", ""))
+        self.vk_titles_lbl.setText(s.get("vk_titles_file", "") or "Не выбран")
+        self.vk_folder_lbl.setText(s.get("vk_video_folder", "") or "Не выбрана")
+        self.vk_delay_spin.setValue(s.get("vk_delay_sec", 10))
+        self.vk_max_spin.setValue(s.get("vk_max_videos", 150))
+
     def _save_ui_to_settings(self):
         s = self.settings
         
@@ -696,6 +811,12 @@ class MainWindow(QMainWindow):
         s.set("file_size_limit_mb", self.spin_size_mb.value())
         s.set("audio_bitrate", self.spin_audio_kbps.value())
 
+        # VK
+        s.set("vk_token", self.vk_token_edit.text().strip())
+        s.set("vk_group_id", self.vk_group_edit.text().strip())
+        s.set("vk_delay_sec", self.vk_delay_spin.value())
+        s.set("vk_max_videos", self.vk_max_spin.value())
+
     def _connect_ui_to_settings(self):
         # Trigger save on any relevant change
         self.cb_duration.currentIndexChanged.connect(self._save_ui_to_settings)
@@ -716,6 +837,12 @@ class MainWindow(QMainWindow):
         self.chk_size_limit.toggled.connect(self._save_ui_to_settings)
         self.spin_size_mb.valueChanged.connect(self._save_ui_to_settings)
         self.spin_audio_kbps.valueChanged.connect(self._save_ui_to_settings)
+
+        # VK
+        self.vk_token_edit.textChanged.connect(self._save_ui_to_settings)
+        self.vk_group_edit.textChanged.connect(self._save_ui_to_settings)
+        self.vk_delay_spin.valueChanged.connect(self._save_ui_to_settings)
+        self.vk_max_spin.valueChanged.connect(self._save_ui_to_settings)
 
     # ------------------------------------------------------------------
     # UI Logic & Events
@@ -797,6 +924,115 @@ class MainWindow(QMainWindow):
             self.profiles.delete_profile(name)
             self._update_profiles_list()
             self._log_message(f"Профиль '{name}' удален.")
+
+    # ------------------------------------------------------------------
+    # VK Uploader
+    # ------------------------------------------------------------------
+
+    def _vk_browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку с видео")
+        if folder:
+            self.vk_folder_lbl.setText(folder)
+            self.settings.set("vk_video_folder", folder)
+
+    def _vk_browse_titles(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл с названиями", filter="Текстовые файлы (*.txt)"
+        )
+        if path:
+            self.vk_titles_lbl.setText(path)
+            self.settings.set("vk_titles_file", path)
+
+    def action_vk_start(self):
+        import os, re
+
+        token = self.vk_token_edit.text().strip()
+        if not token:
+            QMessageBox.warning(self, "ВКонтакте", "Укажите токен ВКонтакте.")
+            return
+
+        folder = self.vk_folder_lbl.text()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "ВКонтакте", "Укажите корректную папку с видео.")
+            return
+
+        titles_path = self.vk_titles_lbl.text()
+        if not titles_path or not os.path.isfile(titles_path):
+            QMessageBox.warning(self, "ВКонтакте", "Укажите файл с названиями.")
+            return
+
+        # --- собираем файлы (естественная сортировка) ---
+        def _nat_key(s: str):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+        exts = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+        files = sorted(
+            [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(exts)],
+            key=lambda p: _nat_key(os.path.basename(p)),
+        )
+
+        if not files:
+            QMessageBox.warning(self, "ВКонтакте", "В папке нет видеофайлов.")
+            return
+
+        with open(titles_path, "r", encoding="utf-8") as fh:
+            titles = [line.strip() for line in fh if line.strip()]
+
+        if not titles:
+            QMessageBox.warning(self, "ВКонтакте", "Файл с названиями пуст.")
+            return
+
+        group_id_str = self.vk_group_edit.text().strip()
+        group_id = int(group_id_str) if group_id_str.isdigit() else None
+
+        total = min(len(files), len(titles), self.vk_max_spin.value())
+        self.vk_progress.setMaximum(total)
+        self.vk_progress.setValue(0)
+        self.vk_log.clear()
+
+        self._vk_uploader = VkUploader(self)
+        self._vk_uploader.configure(
+            token=token,
+            files=files,
+            titles=titles,
+            group_id=group_id,
+            delay=self.vk_delay_spin.value(),
+            max_videos=self.vk_max_spin.value(),
+        )
+        self._vk_uploader.progress.connect(self._on_vk_progress)
+        self._vk_uploader.file_done.connect(self._on_vk_file_done)
+        self._vk_uploader.log_message.connect(self._on_vk_log)
+        self._vk_uploader.finished_all.connect(self._on_vk_finished)
+
+        self.vk_btn_start.setEnabled(False)
+        self.vk_btn_stop.setEnabled(True)
+        self._vk_uploader.start()
+
+    def action_vk_stop(self):
+        if self._vk_uploader and self._vk_uploader.isRunning():
+            self._vk_uploader.cancel()
+            self.vk_btn_stop.setEnabled(False)
+
+    def _on_vk_progress(self, current: int, total: int, filename: str):
+        self.vk_progress.setValue(current)
+        self.vk_progress.setFormat(f"Файл {current} из {total}: {filename}")
+
+    def _on_vk_file_done(self, filename: str, vid_id: str, ok: bool):
+        pass  # подробности уже в лог
+
+    def _on_vk_log(self, text: str):
+        self.vk_log.append(text)
+        scrollbar = self.vk_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _on_vk_finished(self, success: int, errors: int):
+        self.vk_btn_start.setEnabled(True)
+        self.vk_btn_stop.setEnabled(False)
+        self.vk_progress.setFormat(f"Готово: {success} загружено, {errors} ошибок")
+        QMessageBox.information(
+            self, "ВКонтакте",
+            f"Загрузка завершена.\nУспешно: {success}\nОшибок: {errors}"
+        )
 
     # ------------------------------------------------------------------
     # File Management
