@@ -995,6 +995,7 @@ class MainWindow(QMainWindow):
             token=token,
             files=files,
             titles=titles,
+            titles_path=titles_path,
             group_id=group_id,
             delay=self.vk_delay_spin.value(),
             max_videos=self.vk_max_spin.value(),

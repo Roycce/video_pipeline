@@ -3,10 +3,15 @@ Stream Auto Cutter — VK Uploader Module.
 
 Uploads finished video segments to VKontakte in a background QThread,
 emitting Qt signals so the GUI stays responsive.
+
+После успешной загрузки:
+  - видеофайл перемещается в подпапку uploaded/ (рядом с исходной папкой)
+  - использованный заголовок удаляется из titles.txt (первая строка)
 """
 
 from __future__ import annotations
 
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +43,7 @@ class VkUploader(QThread):
         self._group_id: Optional[int] = None
         self._files: list[str] = []
         self._titles: list[str] = []
+        self._titles_path: str = ""
         self._delay: int = 10
         self._max_videos: int = 150
         self._cancelled: bool = False
@@ -47,6 +53,7 @@ class VkUploader(QThread):
         token: str,
         files: list[str],
         titles: list[str],
+        titles_path: str = "",
         group_id: Optional[int] = None,
         delay: int = 10,
         max_videos: int = 150,
@@ -54,6 +61,7 @@ class VkUploader(QThread):
         self._token = token
         self._files = files
         self._titles = titles
+        self._titles_path = titles_path
         self._group_id = group_id
         self._delay = delay
         self._max_videos = max_videos
@@ -61,6 +69,10 @@ class VkUploader(QThread):
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    # ------------------------------------------------------------------
+    # Main upload loop
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
         try:
@@ -125,12 +137,17 @@ class VkUploader(QThread):
             try:
                 result = upload.video(**upload_kwargs)
                 video_id = str(result.get("video_id", "OK"))
-                self._log(f"   OK Загружен (id: {video_id})")
+                self._log(f"   ✓ Загружен (id: {video_id})")
                 self.file_done.emit(filename, video_id, True)
                 success_count += 1
+
+                # --- После успешной загрузки ---
+                self._move_to_uploaded(filepath)
+                self._pop_first_title()
+
             except Exception as e:
                 err_str = str(e)
-                self._log(f"   FAIL Ошибка: {err_str}")
+                self._log(f"   ✗ Ошибка: {err_str}")
                 self.file_done.emit(filename, err_str, False)
                 error_count += 1
 
@@ -145,6 +162,44 @@ class VkUploader(QThread):
         self._log(f"Готово. Успешно: {success_count}, Ошибок: {error_count}")
         self._log("=" * 50)
         self.finished_all.emit(success_count, error_count)
+
+    # ------------------------------------------------------------------
+    # Post-upload helpers
+    # ------------------------------------------------------------------
+
+    def _move_to_uploaded(self, filepath: str) -> None:
+        """Переносит файл в подпапку uploaded/ рядом с исходной папкой."""
+        src = Path(filepath)
+        if not src.exists():
+            return
+        dest_dir = src.parent / "uploaded"
+        try:
+            dest_dir.mkdir(exist_ok=True)
+            dest = dest_dir / src.name
+            # Если файл с таким именем уже есть — добавляем суффикс
+            if dest.exists():
+                dest = dest_dir / f"{src.stem}_dup{src.suffix}"
+            shutil.move(str(src), str(dest))
+            self._log(f"   → Перемещён в uploaded/{src.name}")
+        except Exception as e:
+            self._log(f"   ⚠ Не удалось переместить файл: {e}")
+
+    def _pop_first_title(self) -> None:
+        """Удаляет первую строку из titles.txt после успешной загрузки."""
+        if not self._titles_path:
+            return
+        path = Path(self._titles_path)
+        if not path.exists():
+            return
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            # Убираем первую непустую строку
+            remaining = lines[1:] if lines else []
+            path.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
+        except Exception as e:
+            self._log(f"   ⚠ Не удалось обновить titles.txt: {e}")
+
+    # ------------------------------------------------------------------
 
     def _log(self, text: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
