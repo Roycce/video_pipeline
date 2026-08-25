@@ -104,7 +104,11 @@ class LogoEditDialog(QDialog):
         h_time = QHBoxLayout()
         h_time.addWidget(QLabel("Показ:"))
         self.cb_time = QComboBox()
-        self.cb_time.addItems(["full", "first_n", "last_n", "custom"])
+        self.cb_time.addItem("На всё видео", "full")
+        self.cb_time.addItem("Только на сегмент (без интро/аутро)", "segment_only")
+        self.cb_time.addItem("Первые N секунд", "first_n")
+        self.cb_time.addItem("Последние N секунд", "last_n")
+        self.cb_time.addItem("Своё время", "custom")
         self.cb_time.currentIndexChanged.connect(self._on_time_changed)
         h_time.addWidget(self.cb_time)
         layout.addLayout(h_time)
@@ -134,8 +138,20 @@ class LogoEditDialog(QDialog):
             self.lbl_path.setText(f)
 
     def _on_time_changed(self):
-        self.w_times.setVisible(self.cb_time.currentText() != "full")
-        
+        display = self.cb_time.currentData()
+        # поля времени нужны только для first_n / last_n / custom
+        self.w_times.setVisible(display in ("first_n", "last_n", "custom"))
+        # для first_n — только поле "До", для last_n — только "От"
+        if display == "first_n":
+            self.spin_tstart.setEnabled(False)
+            self.spin_tend.setEnabled(True)
+        elif display == "last_n":
+            self.spin_tstart.setEnabled(True)
+            self.spin_tend.setEnabled(False)
+        else:
+            self.spin_tstart.setEnabled(True)
+            self.spin_tend.setEnabled(True)
+
     def _on_type_changed(self):
         self.w_color.setVisible(self.cb_type.currentText() == "video_chromakey")
 
@@ -147,7 +163,10 @@ class LogoEditDialog(QDialog):
         self.spin_op.setValue(self.logo_data.get("opacity", 80))
         self.spin_angle.setValue(self.logo_data.get("angle", 0))
         self.cb_color.setCurrentText(self.logo_data.get("color", "Green (0x00FF00)"))
-        self.cb_time.setCurrentText(self.logo_data.get("display", "full"))
+        # находим индекс по data-значению
+        display_val = self.logo_data.get("display", "full")
+        idx = self.cb_time.findData(display_val)
+        self.cb_time.setCurrentIndex(idx if idx >= 0 else 0)
         self.spin_tstart.setValue(self.logo_data.get("time_start", 0))
         self.spin_tend.setValue(self.logo_data.get("time_end", 10))
         self._on_time_changed()
@@ -162,9 +181,9 @@ class LogoEditDialog(QDialog):
             "opacity": self.spin_op.value(),
             "angle": self.spin_angle.value(),
             "color": self.cb_color.currentText(),
-            "display": self.cb_time.currentText(),
+            "display": self.cb_time.currentData(),   # data-значение, не текст с экрана
             "time_start": self.spin_tstart.value(),
-            "time_end": self.spin_tend.value()
+            "time_end": self.spin_tend.value(),
         }
 
 class MainWindow(QMainWindow):

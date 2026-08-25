@@ -318,6 +318,12 @@ class FFmpegHandler:
                     ts = logo.get("time_start", 0)
                     te = logo.get("time_end", 10)
                     enable = f":enable='between(t,{ts},{te})'"
+                elif display == "segment_only":
+                    # только основной сегмент — без интро и аутро
+                    t_start = intro_duration
+                    t_end = intro_duration + segment_duration
+                    enable = f":enable='between(t,{t_start:.3f},{t_end:.3f})'"
+
 
                 logo_w = max(32, int(target_w * logo_size_pct))
                 logo_lbl = f"logo{i}"
