@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -76,7 +77,11 @@ def _resolve_binary(name: str) -> str:
         return str(p)
 
     # 4. System PATH
-    return name
+    which_path = shutil.which(exe) or shutil.which(name)
+    if which_path:
+        return which_path
+
+    return exe
 
 
 def get_ffmpeg_path() -> str:
@@ -108,22 +113,34 @@ class FFmpegHandler:
             has_audio  – bool
             video_codec – str
         """
+        abs_path = str(Path(path).resolve())
         cmd = [
-            get_ffprobe_path(), "-v", "quiet",
+            get_ffprobe_path(), "-loglevel", "error",
             "-print_format", "json",
             "-show_format", "-show_streams",
-            str(path),
+            abs_path,
         ]
         result = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=_CREATION_FLAGS,
         )
         if result.returncode != 0:
-            raise FFmpegError(f"ffprobe failed for {path}:\n{result.stderr[:1000]}")
+            raise FFmpegError(f"ffprobe failed for {abs_path}:\n{result.stderr[:1000]}")
 
-        data = json.loads(result.stdout)
+        if not result.stdout or not result.stdout.strip():
+            err_msg = result.stderr.strip() if result.stderr else "empty output"
+            raise FFmpegError(f"ffprobe returned no metadata for {abs_path}:\n{err_msg[:1000]}")
+
+        try:
+            data = json.loads(result.stdout)
+        except Exception as err:
+            raise FFmpegError(f"Failed to parse ffprobe JSON output for {abs_path}: {err}\nOutput: {result.stdout[:500]}")
 
         # --- video stream ---
         video = next(
@@ -515,6 +532,7 @@ class FFmpegHandler:
 
         process = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=_CREATION_FLAGS,

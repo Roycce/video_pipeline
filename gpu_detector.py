@@ -38,7 +38,9 @@ def _test_encoder(encoder: str, ffmpeg_path: str = "ffmpeg") -> bool:
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             timeout=15,
             creationflags=_CREATION_FLAGS,
         )
