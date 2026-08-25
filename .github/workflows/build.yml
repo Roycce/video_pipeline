@@ -40,11 +40,8 @@ jobs:
         shell: pwsh
 
       - name: Build executable with PyInstaller
-        run: |
-          pyinstaller --onefile --windowed --name StreamAutoCutter ^
-            --add-binary "ffmpeg.exe;." ^
-            --add-binary "ffprobe.exe;." ^
-            main.py
+        run: pyinstaller --onefile --windowed --name StreamAutoCutter --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." main.py
+        shell: cmd
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
