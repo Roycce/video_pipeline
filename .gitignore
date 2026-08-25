@@ -234,5 +234,11 @@ patch_*.py
 test_build.py
 
 # Local config (раскомментируй если не хочешь пушить)
-# settings.json
+# Sensitive / local config — не должны попадать в репозиторий
+settings.json
+profiles.json
+titles.txt
+*.log
+progress.json
+
 # profiles.json
