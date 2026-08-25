@@ -23,7 +23,6 @@ from vk_uploader import VkUploader
 
 from queue_manager import QueueManager, TaskStatus
 from settings import Settings
-from profiles import ProfileManager
 from gpu_detector import detect_available_encoders
 from ffmpeg_handler import get_ffmpeg_path
 
@@ -191,10 +190,9 @@ class LogoEditDialog(QDialog):
         }
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings, profiles: ProfileManager):
+    def __init__(self, settings: Settings):
         super().__init__()
         self.settings = settings
-        self.profiles = profiles
 
         self.setWindowTitle("Stream Auto Cutter")
         self.resize(1000, 700)
@@ -276,7 +274,6 @@ class MainWindow(QMainWindow):
         self.tab_logo = self._create_logo_tab()
         self.tab_video = self._create_video_tab()
         self.tab_size = self._create_size_tab()
-        self.tab_profiles = self._create_profiles_tab()
         self.tab_vk = self._create_vk_tab()
         
         self.tabs.addTab(self.tab_cut, "Нарезка")
@@ -284,7 +281,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_logo, "Логотип")
         self.tabs.addTab(self.tab_video, "Видео")
         self.tabs.addTab(self.tab_size, "Размер")
-        self.tabs.addTab(self.tab_profiles, "Профили")
         self.tabs.addTab(self.tab_vk, "ВКонтакте")
 
         # VK uploader worker
@@ -572,33 +568,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
-    def _create_profiles_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        h_prof = QHBoxLayout()
-        self.cb_profiles = QComboBox()
-        self._update_profiles_list()
-        h_prof.addWidget(self.cb_profiles, stretch=1)
-        
-        btn_load = QPushButton("Загрузить")
-        btn_load.clicked.connect(self.action_load_profile)
-        h_prof.addWidget(btn_load)
-        layout.addLayout(h_prof)
-        
-        h_save = QHBoxLayout()
-        btn_save = QPushButton("Сохранить как...")
-        btn_save.clicked.connect(self.action_save_profile)
-        h_save.addWidget(btn_save)
-        
-        btn_del = QPushButton("Удалить")
-        btn_del.clicked.connect(self.action_delete_profile)
-        h_save.addWidget(btn_del)
-        h_save.addStretch()
-        layout.addLayout(h_save)
-        
-        layout.addStretch()
-        return widget
+
 
     def _create_vk_tab(self) -> QWidget:
         """Вкладка загрузки видео в ВКонтакте."""
@@ -1015,52 +985,7 @@ class MainWindow(QMainWindow):
             self.settings.set("logo_path", path)
             self._save_ui_to_settings()
 
-    def _update_profiles_list(self):
-        curr = self.cb_profiles.currentText()
-        self.cb_profiles.clear()
-        self.cb_profiles.addItems(self.profiles.get_all_names())
-        idx = self.cb_profiles.findText(curr)
-        if idx >= 0:
-            self.cb_profiles.setCurrentIndex(idx)
 
-    # ------------------------------------------------------------------
-    # Profile Actions
-    # ------------------------------------------------------------------
-    
-    def action_load_profile(self):
-        name = self.cb_profiles.currentText()
-        if not name: return
-        data = self.profiles.get_profile(name)
-        if data:
-            self.settings.update(data)
-            self._load_settings_to_ui()
-            self._log_message(f"Профиль '{name}' загружен.")
-            
-    def action_save_profile(self):
-        from PySide6.QtWidgets import QInputDialog
-        self._save_ui_to_settings()
-        name, ok = QInputDialog.getText(self, "Сохранить профиль", "Имя профиля:")
-        if ok and name:
-            if self.profiles.is_builtin(name):
-                QMessageBox.warning(self, "Ошибка", "Нельзя перезаписать встроенный профиль.")
-                return
-            self.profiles.save_profile(name, self.settings.get_all())
-            self._update_profiles_list()
-            self.cb_profiles.setCurrentText(name)
-            self._log_message(f"Профиль '{name}' сохранен.")
-            
-    def action_delete_profile(self):
-        name = self.cb_profiles.currentText()
-        if not name: return
-        if self.profiles.is_builtin(name):
-            QMessageBox.warning(self, "Ошибка", "Нельзя удалить встроенный профиль.")
-            return
-        
-        res = QMessageBox.question(self, "Удаление", f"Удалить профиль '{name}'?")
-        if res == QMessageBox.StandardButton.Yes:
-            self.profiles.delete_profile(name)
-            self._update_profiles_list()
-            self._log_message(f"Профиль '{name}' удален.")
 
     # ------------------------------------------------------------------
     # VK Uploader

@@ -24,7 +24,6 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gui import MainWindow
 from settings import Settings
-from profiles import ProfileManager
 
 
 def global_exception_handler(exctype, value, tb):
@@ -52,20 +51,18 @@ def main():
     # Initialize application
     app = QApplication(sys.argv)
     
-    # Load settings and profiles from the same directory as main.py or executable
+    # Load settings from the same directory as main.py or executable
     if getattr(sys, 'frozen', False):
         base_dir = Path(sys.executable).parent.absolute()
     else:
         base_dir = Path(__file__).parent.absolute()
 
     settings_path = base_dir / "settings.json"
-    profiles_path = base_dir / "profiles.json"
     
     settings = Settings(settings_path)
-    profiles = ProfileManager(profiles_path)
     
     # Create and show main window
-    window = MainWindow(settings, profiles)
+    window = MainWindow(settings)
     window.show()
     
     # Start event loop
