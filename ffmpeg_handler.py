@@ -280,6 +280,14 @@ class FFmpegHandler:
                 logo_indices.append(idx)
                 idx += 1
 
+        # ---- hardware acceleration ----
+        hw_args = []
+        codec = settings.get("codec", "h264_nvenc")
+        if "nvenc" in codec:
+            hw_args = ["-hwaccel", "cuda"]
+        elif "videotoolbox" in codec:
+            hw_args = ["-hwaccel", "videotoolbox"]
+
         needs_concat = "intro" in indices or "outro" in indices
         needs_logo = len(logo_indices) > 0
         needs_scale = settings.get("resolution", "source") != "source"
@@ -289,9 +297,14 @@ class FFmpegHandler:
         # ---- total output duration (for bitrate calc) ----
         total_output_duration = segment_duration + intro_duration + outro_duration
 
-        # ---- simple path (no filtergraph) ----
+        # ---- instant stream copy path (no filter & no bitrate restriction) ----
+        if not needs_filter and not settings.get("file_size_limit_enabled"):
+            cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs + ["-c", "copy", str(output_path)]
+            return cmd
+
+        # ---- simple encoding path (no filtergraph) ----
         if not needs_filter:
-            cmd = [get_ffmpeg_path(), "-y"] + inputs
+            cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs
             cmd += self._encoding_args(settings, total_output_duration)
             cmd.append(str(output_path))
             return cmd
@@ -443,7 +456,7 @@ class FFmpegHandler:
                 video_out = "outv"
 
         # ---- assemble command ----
-        cmd = [get_ffmpeg_path(), "-y"] + inputs
+        cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs
         cmd += ["-filter_complex", ";".join(filters)]
 
         # map video
@@ -468,7 +481,7 @@ class FFmpegHandler:
 
     def _encoding_args(self, settings: dict, duration: float) -> list[str]:
         """Return the encoding portion of an FFmpeg command."""
-        args: list[str] = []
+        args: list[str] = ["-threads", "0"]
         codec = settings.get("codec", "h264_nvenc")
 
         # Auto-fallback: if a GPU codec was chosen but is unavailable, switch to CPU
@@ -487,20 +500,25 @@ class FFmpegHandler:
                 duration,
                 settings.get("audio_bitrate", 128),
             )
-            if "videotoolbox" in codec:
+            if "nvenc" in codec:
+                args += ["-b:v", f"{br}k",
+                         "-maxrate", f"{int(br * 1.5)}k",
+                         "-bufsize", f"{int(br * 2)}k",
+                         "-preset", "p2"]
+            elif "videotoolbox" in codec:
                 args += ["-b:v", f"{br}k"]
             else:
                 args += ["-b:v", f"{br}k",
                          "-maxrate", f"{int(br * 1.5)}k",
-                         "-bufsize", f"{int(br * 2)}k"]
+                         "-bufsize", f"{int(br * 2)}k",
+                         "-preset", "veryfast"]
         else:
             if "nvenc" in codec:
-                args += ["-preset", "p4", "-tune", "hq",
-                         "-cq", "23"]
+                args += ["-preset", "p2", "-tune", "hq", "-cq", "23"]
             elif "videotoolbox" in codec:
                 args += ["-q:v", "65", "-tag:v", "hvc1"]
             else:
-                args += ["-crf", "18", "-preset", "slow"]
+                args += ["-crf", "22", "-preset", "veryfast"]
 
         audio_br = settings.get("audio_bitrate", 128)
         args += ["-c:a", "aac", "-b:a", f"{audio_br}k"]
