@@ -199,6 +199,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
         self.setAcceptDrops(True)
 
+        # Set App Window Icon
+        for icon_name in ("icon.png", "icon.ico"):
+            meipass = getattr(sys, "_MEIPASS", None)
+            icon_p = Path(meipass) / icon_name if meipass else Path(__file__).parent / icon_name
+            if icon_p.is_file():
+                self.setWindowIcon(QIcon(str(icon_p)))
+                break
+
         # Apply dark theme
         self.apply_theme()
 
