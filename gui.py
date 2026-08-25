@@ -4,6 +4,7 @@ Stream Auto Cutter — GUI Module.
 Main application window and widgets using PySide6.
 """
 
+import sys
 import time
 import threading
 from pathlib import Path
