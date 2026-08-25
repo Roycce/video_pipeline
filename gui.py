@@ -273,14 +273,12 @@ class MainWindow(QMainWindow):
         self.tab_io = self._create_io_tab()
         self.tab_logo = self._create_logo_tab()
         self.tab_video = self._create_video_tab()
-        self.tab_size = self._create_size_tab()
         self.tab_vk = self._create_vk_tab()
         
         self.tabs.addTab(self.tab_cut, "Нарезка")
         self.tabs.addTab(self.tab_io, "Интро/Аутро")
         self.tabs.addTab(self.tab_logo, "Логотип")
         self.tabs.addTab(self.tab_video, "Видео")
-        self.tabs.addTab(self.tab_size, "Размер")
         self.tabs.addTab(self.tab_vk, "ВКонтакте")
 
         # VK uploader worker
@@ -538,35 +536,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
-    def _create_size_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        self.chk_size_limit = QCheckBox("Ограничить размер файла")
-        self.chk_size_limit.toggled.connect(self._on_size_limit_toggled)
-        layout.addWidget(self.chk_size_limit)
-        
-        h_size = QHBoxLayout()
-        h_size.addWidget(QLabel("Желаемый размер:"))
-        self.spin_size_mb = QSpinBox()
-        self.spin_size_mb.setRange(10, 10000)
-        self.spin_size_mb.setSuffix(" MB")
-        h_size.addWidget(self.spin_size_mb)
-        h_size.addStretch()
-        layout.addLayout(h_size)
-        
-        h_audio = QHBoxLayout()
-        h_audio.addWidget(QLabel("Битрейт аудио:"))
-        self.spin_audio_kbps = QSpinBox()
-        self.spin_audio_kbps.setRange(32, 320)
-        self.spin_audio_kbps.setSuffix(" kbps")
-        self.spin_audio_kbps.setValue(128)
-        h_audio.addWidget(self.spin_audio_kbps)
-        h_audio.addStretch()
-        layout.addLayout(h_audio)
-        
-        layout.addStretch()
-        return widget
+
 
 
 
@@ -778,10 +748,7 @@ class MainWindow(QMainWindow):
         else:
             self.cb_codec.setCurrentIndex(0)
             
-        # Size
-        self.chk_size_limit.setChecked(s.get("file_size_limit_enabled", True))
-        self.spin_size_mb.setValue(s.get("file_size_limit_mb", 650))
-        self.spin_audio_kbps.setValue(s.get("audio_bitrate", 128))
+
 
         # VK
         self.vk_token_edit.setText(s.get("vk_token", ""))
@@ -817,10 +784,7 @@ class MainWindow(QMainWindow):
         s.set("fps", self.cb_fps.currentText())
         s.set("codec", self.cb_codec.currentData())
         
-        # Size
-        s.set("file_size_limit_enabled", self.chk_size_limit.isChecked())
-        s.set("file_size_limit_mb", self.spin_size_mb.value())
-        s.set("audio_bitrate", self.spin_audio_kbps.value())
+
 
         # VK
         s.set("vk_token", self.vk_token_edit.text().strip())
@@ -845,9 +809,7 @@ class MainWindow(QMainWindow):
         self.cb_fps.currentIndexChanged.connect(self._save_ui_to_settings)
         self.cb_codec.currentIndexChanged.connect(self._save_ui_to_settings)
         
-        self.chk_size_limit.toggled.connect(self._save_ui_to_settings)
-        self.spin_size_mb.valueChanged.connect(self._save_ui_to_settings)
-        self.spin_audio_kbps.valueChanged.connect(self._save_ui_to_settings)
+
 
         # VK
         self.vk_token_edit.textChanged.connect(self._save_ui_to_settings)
@@ -967,8 +929,7 @@ class MainWindow(QMainWindow):
         self.spin_res_w.setVisible(show_custom)
         self.spin_res_h.setVisible(show_custom)
         
-    def _on_size_limit_toggled(self, checked: bool):
-        self.spin_size_mb.setEnabled(checked)
+
         
     def _browse_file(self, label_widget: QLabel, settings_key: str):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", filter="Видео (*.mp4 *.mkv *.mov)")

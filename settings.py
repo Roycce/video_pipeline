@@ -32,7 +32,7 @@ DEFAULT_SETTINGS = {
     "codec": "libx264",                 # libx264, hevc_videotoolbox, h264_nvenc, etc.
 
     # --- File Size ---
-    "file_size_limit_enabled": True,
+    "file_size_limit_enabled": False,
     "file_size_limit_mb": 650,
     "audio_bitrate": 128,               # kbps
 
