@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from ffmpeg_handler import FFmpegHandler
+from ffmpeg_handler import FFmpegHandler, ProgressInfo
 
 
 class VideoProcessor:
@@ -38,7 +38,7 @@ class VideoProcessor:
         self,
         stream_path: str,
         settings: dict,
-        progress_callback: Callable[[int, float], None] | None = None,
+        progress_callback: Callable[[int, int, float, float], None] | None = None,
         cancel_event: threading.Event | None = None,
         pause_check: Callable[[], bool] | None = None,
         log_callback: Callable[[str], None] | None = None,
@@ -48,9 +48,10 @@ class VideoProcessor:
 
         Parameters
         ----------
-        progress_callback(segment_idx, percent)
-            Called repeatedly during encoding with current segment index
-            and 0-100 % progress for that segment.
+        progress_callback(segment_idx, total_segments, percent, speed)
+            Called repeatedly during encoding with current segment index,
+            total number of segments, 0-100 % progress for that segment,
+            and current encoding speed (e.g. 2.4 = 2.4x realtime).
         cancel_event
             A ``threading.Event`` — if set, processing stops ASAP.
         pause_check()
@@ -148,9 +149,9 @@ class VideoProcessor:
                     outro_duration=outro_dur,
                 )
 
-                def _on_progress(pct: float, _si=seg_idx):
+                def _on_progress(info: ProgressInfo, _si=seg_idx):
                     if progress_callback:
-                        progress_callback(_si, pct)
+                        progress_callback(_si, n_segments, info.percent, info.speed)
 
                 self._ffmpeg.run_command(
                     proc_cmd,

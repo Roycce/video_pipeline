@@ -5,9 +5,20 @@ Initialises the Qt Application, loads settings and profiles,
 and shows the main window.
 """
 
+import os
 import sys
 import traceback
 from pathlib import Path
+
+# Ensure UTF-8 encoding for Cyrillic paths on Windows
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    # Enable long path support (> 260 chars) on Windows 10+
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW("")
+    except Exception:
+        pass
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 

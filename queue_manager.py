@@ -41,6 +41,11 @@ class StreamTask:
         self.current_segment: int = 0
         self.progress: float = 0.0
         self.error_message: str = ""
+        # Extended progress info
+        self.speed: float = 0.0           # encoding speed (e.g. 2.4x)
+        self.start_time: float = 0.0      # time.time() when processing started
+        self.elapsed_sec: float = 0.0     # seconds elapsed for this task
+        self.eta_sec: float = 0.0         # estimated seconds remaining for this task
 
 
 class QueueManager(QThread):
@@ -118,45 +123,83 @@ class QueueManager(QThread):
         ffmpeg = FFmpegHandler()
         processor = VideoProcessor(ffmpeg)
         settings = self._settings_snapshot
+        seg_sec = settings.get("segment_duration_min", 16) * 60
 
+        # ============================================================
+        # Phase 1: probe ALL files upfront → total duration & chunks
+        # ============================================================
+        self.log_message.emit("Анализ всех файлов…")
         for idx, task in enumerate(self._tasks):
             if self._cancel_event.is_set():
-                task.status = TaskStatus.CANCELLED
-                self.task_updated.emit(idx)
-                continue
-
+                break
             if task.status in (TaskStatus.DONE, TaskStatus.CANCELLED):
                 continue
 
-            # ---- probe ----
             task.status = TaskStatus.PROBING
             self.task_updated.emit(idx)
 
             try:
                 info = ffmpeg.probe_video(task.file_path)
                 task.duration = info["duration"]
-                seg_sec = settings.get("segment_duration_min", 16) * 60
                 task.num_segments = max(
                     1,
                     len(VideoProcessor.calculate_segments(task.duration, seg_sec)),
                 )
+                task.status = TaskStatus.PENDING  # back to pending, will process later
                 self.task_updated.emit(idx)
             except Exception as exc:
                 task.status = TaskStatus.ERROR
                 task.error_message = str(exc)
                 self.task_completed.emit(idx, False, str(exc))
                 self.task_updated.emit(idx)
+
+        # Emit update so GUI can show total chunks immediately
+        total_chunks = sum(t.num_segments for t in self._tasks)
+        total_dur = sum(t.duration for t in self._tasks)
+        self.log_message.emit(
+            f"Всего: {len(self._tasks)} файлов, "
+            f"{total_chunks} кусков, "
+            f"{int(total_dur // 60)} мин видео"
+        )
+        # notify GUI about all tasks (they now have duration & num_segments)
+        for idx in range(len(self._tasks)):
+            self.task_updated.emit(idx)
+
+        # ============================================================
+        # Phase 2: process each file
+        # ============================================================
+        for idx, task in enumerate(self._tasks):
+            if self._cancel_event.is_set():
+                task.status = TaskStatus.CANCELLED
+                self.task_updated.emit(idx)
+                continue
+
+            if task.status in (TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.ERROR):
                 continue
 
             # ---- process ----
             task.status = TaskStatus.PROCESSING
+            task.start_time = time.time()
             self.task_updated.emit(idx)
 
-            def _on_progress(seg_idx: int, pct: float, _i=idx) -> None:
-                task.current_segment = seg_idx
-                task.progress = (
-                    (seg_idx + pct / 100.0) / task.num_segments * 100.0
+            def _on_progress(
+                seg_idx: int, total_segs: int, pct: float, speed: float,
+                _i=idx, _task=task,
+            ) -> None:
+                _task.current_segment = seg_idx
+                _task.num_segments = total_segs
+                _task.speed = speed
+                _task.progress = (
+                    (seg_idx + pct / 100.0) / total_segs * 100.0
                 )
+                _task.elapsed_sec = time.time() - _task.start_time
+                # ETA for remaining video in this task based on encoding speed
+                if speed > 0 and _task.duration > 0:
+                    processed_video_sec = _task.duration * _task.progress / 100.0
+                    remaining_video_sec = _task.duration - processed_video_sec
+                    _task.eta_sec = remaining_video_sec / speed
+                else:
+                    _task.eta_sec = 0.0
                 self.task_progress.emit(_i, seg_idx, pct)
                 self.task_updated.emit(_i)
 
@@ -179,6 +222,8 @@ class QueueManager(QThread):
                 else:
                     task.status = TaskStatus.DONE
                     task.progress = 100.0
+                    task.elapsed_sec = time.time() - task.start_time
+                    task.eta_sec = 0.0
                     self.task_completed.emit(idx, True, "")
 
             except CancelledError:

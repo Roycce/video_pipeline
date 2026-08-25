@@ -28,9 +28,23 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Download FFmpeg
+        run: |
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_temp
+          $ffmpegDir = Get-ChildItem -Path ffmpeg_temp -Directory | Select-Object -First 1
+          Copy-Item "$($ffmpegDir.FullName)\bin\ffmpeg.exe" -Destination "."
+          Copy-Item "$($ffmpegDir.FullName)\bin\ffprobe.exe" -Destination "."
+          Remove-Item -Recurse -Force ffmpeg_temp, ffmpeg.zip
+        shell: pwsh
+
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --name StreamAutoCutter main.py
+          pyinstaller --onefile --windowed --name StreamAutoCutter ^
+            --add-binary "ffmpeg.exe;." ^
+            --add-binary "ffprobe.exe;." ^
+            main.py
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -40,17 +54,34 @@ jobs:
           body: |
             ## Stream Auto Cutter ${{ github.ref_name }}
 
-            ### Что нового в 1.1.0
-            - **ВКонтакте**: после успешной загрузки видео автоматически перемещается в папку `uploaded/`
-            - **ВКонтакте**: использованное название удаляется из `titles.txt` — не нужно следить вручную
-            - **Логотип**: новая опция «Только на сегмент (без интро/аутро)» — лого не показывается поверх заставок
-            - **Логотип**: читаемые названия режимов показа вместо технических кодов
-            - **Логотип**: для режима «Первые N сек» и «Последние N сек» отключаются неактивные поля
+            ### Что нового в 1.2.0
+
+            #### 📊 Прогресс и ETA
+            - Все файлы анализируются **до начала** обработки — общее количество кусков и время известно сразу
+            - Строка прогресса: `Кусков: 5/24 | Прошло: 01:20 | Осталось: ~12:45 | Скорость: 2.4x`
+            - В таблице файлов: `[Кусок 3/12] 45%` вместо просто процентов
+            - ETA рассчитывается для **всей очереди** целиком
+
+            #### 🚀 GPU-ускорение
+            - Автоматический детект NVENC (NVIDIA) и VideoToolbox (Mac) при запуске
+            - Недоступные кодеки помечаются как `(недоступен)` в интерфейсе
+            - Автоматический откат на CPU (libx264/libx265) если GPU недоступен — без вылетов
+
+            #### 🪟 Улучшения для Windows
+            - Поддержка кириллицы и пробелов в путях к файлам
+            - FFmpeg-процессы запускаются с высоким приоритетом CPU
+
+            #### 📦 Всё включено
+            - FFmpeg и FFprobe вшиты внутрь `.exe` — не нужно скачивать отдельно
+            - Просто скачай и запускай!
+
+            #### ⚙️ Прочее
+            - Настройки сохраняются при обновлении (лежат рядом с .exe)
 
             ### Установка
             1. Скачай `StreamAutoCutter.exe`
-            2. Положи рядом `ffmpeg.exe` и `ffprobe.exe`
-            3. Запускай
+            2. Запускай — всё уже внутри!
+            3. При обновлении — просто замени .exe, настройки сохранятся
 
             > Требует Windows 10/11 x64
           files: dist/StreamAutoCutter.exe

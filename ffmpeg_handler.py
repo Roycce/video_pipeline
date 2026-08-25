@@ -15,11 +15,15 @@ import re
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-# Hide console window on Windows
-_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+# Hide console window on Windows; give FFmpeg child processes high priority
+if sys.platform == "win32":
+    _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.HIGH_PRIORITY_CLASS
+else:
+    _CREATION_FLAGS = 0
 
 
 class FFmpegError(RuntimeError):
@@ -28,6 +32,61 @@ class FFmpegError(RuntimeError):
 
 class CancelledError(RuntimeError):
     """Raised when the user cancels processing."""
+
+
+@dataclass
+class ProgressInfo:
+    """Extended progress data emitted during FFmpeg processing."""
+    percent: float = 0.0
+    speed: float = 0.0        # e.g. 2.4 means 2.4x realtime
+    current_time: float = 0.0  # seconds of output processed so far
+
+
+def _resolve_binary(name: str) -> str:
+    """
+    Locate an FFmpeg binary (*name* = ``'ffmpeg'`` or ``'ffprobe'``).
+
+    Search order:
+    1. PyInstaller ``_MEIPASS`` temp dir (frozen one-file build).
+    2. Next to the running executable / script.
+    3. ``ffmpeg/`` sub-folder next to the executable.
+    4. System ``PATH`` (fallback).
+    """
+    exe = f"{name}.exe" if sys.platform == "win32" else name
+
+    # 1. PyInstaller bundle
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        p = Path(meipass) / exe
+        if p.is_file():
+            return str(p)
+
+    # 2. Next to executable / script
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    p = base / exe
+    if p.is_file():
+        return str(p)
+
+    # 3. ffmpeg/ sub-folder
+    p = base / "ffmpeg" / exe
+    if p.is_file():
+        return str(p)
+
+    # 4. System PATH
+    return name
+
+
+def get_ffmpeg_path() -> str:
+    """Return the resolved path to the ``ffmpeg`` binary."""
+    return _resolve_binary("ffmpeg")
+
+
+def get_ffprobe_path() -> str:
+    """Return the resolved path to the ``ffprobe`` binary."""
+    return _resolve_binary("ffprobe")
 
 
 class FFmpegHandler:
@@ -50,7 +109,7 @@ class FFmpegHandler:
             video_codec – str
         """
         cmd = [
-            "ffprobe", "-v", "quiet",
+            get_ffprobe_path(), "-v", "quiet",
             "-print_format", "json",
             "-show_format", "-show_streams",
             str(path),
@@ -140,7 +199,7 @@ class FFmpegHandler:
     ) -> list[str]:
         """Stream-copy split (instant, keyframe-aligned)."""
         return [
-            "ffmpeg", "-y",
+            get_ffmpeg_path(), "-y",
             "-ss", f"{start_sec:.3f}",
             "-i", str(input_path),
             "-t", f"{duration_sec:.3f}",
@@ -215,7 +274,7 @@ class FFmpegHandler:
 
         # ---- simple path (no filtergraph) ----
         if not needs_filter:
-            cmd = ["ffmpeg", "-y"] + inputs
+            cmd = [get_ffmpeg_path(), "-y"] + inputs
             cmd += self._encoding_args(settings, total_output_duration)
             cmd.append(str(output_path))
             return cmd
@@ -367,7 +426,7 @@ class FFmpegHandler:
                 video_out = "outv"
 
         # ---- assemble command ----
-        cmd = ["ffmpeg", "-y"] + inputs
+        cmd = [get_ffmpeg_path(), "-y"] + inputs
         cmd += ["-filter_complex", ";".join(filters)]
 
         # map video
@@ -394,6 +453,15 @@ class FFmpegHandler:
         """Return the encoding portion of an FFmpeg command."""
         args: list[str] = []
         codec = settings.get("codec", "h264_nvenc")
+
+        # Auto-fallback: if a GPU codec was chosen but is unavailable, switch to CPU
+        if codec in ("h264_nvenc", "hevc_nvenc", "h264_videotoolbox", "hevc_videotoolbox"):
+            from gpu_detector import detect_available_encoders
+            avail = detect_available_encoders(get_ffmpeg_path())
+            if not avail.get(codec, False):
+                fallback = "libx265" if ("hevc" in codec or "265" in codec) else "libx264"
+                codec = fallback
+
         args += ["-c:v", codec]
 
         if settings.get("file_size_limit_enabled") and settings.get("file_size_limit_mb"):
@@ -429,14 +497,15 @@ class FFmpegHandler:
         self,
         cmd: list[str],
         total_duration: float | None = None,
-        progress_callback: Callable[[float], None] | None = None,
+        progress_callback: Callable[[ProgressInfo], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
         """
         Execute an FFmpeg command.
 
         If *total_duration* and *progress_callback* are provided the method
-        uses ``-progress pipe:1`` to report real-time progress (0–100 %).
+        uses ``-progress pipe:1`` to report real-time progress via
+        :class:`ProgressInfo` (percent, speed, current_time).
         """
         cmd = list(cmd)  # copy
         use_progress = bool(progress_callback and total_duration and total_duration > 0)
@@ -465,6 +534,8 @@ class FFmpegHandler:
         try:
             if use_progress:
                 assert process.stdout is not None
+                current_time = 0.0
+                current_speed = 0.0
                 for raw_line in iter(process.stdout.readline, b""):
                     # cancellation check
                     if cancel_event and cancel_event.is_set():
@@ -475,10 +546,24 @@ class FFmpegHandler:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if line.startswith("out_time="):
                         time_str = line.split("=", 1)[1]
-                        current = self._parse_time(time_str)
-                        if current is not None and total_duration > 0:
-                            pct = min(100.0, current / total_duration * 100)
-                            progress_callback(pct)
+                        parsed = self._parse_time(time_str)
+                        if parsed is not None:
+                            current_time = parsed
+                    elif line.startswith("speed="):
+                        speed_str = line.split("=", 1)[1].strip().rstrip("x")
+                        try:
+                            current_speed = float(speed_str)
+                        except (ValueError, TypeError):
+                            current_speed = 0.0
+                    elif line.startswith("progress="):
+                        # end-of-chunk marker — emit progress
+                        if total_duration > 0:
+                            pct = min(100.0, current_time / total_duration * 100)
+                            progress_callback(ProgressInfo(
+                                percent=pct,
+                                speed=current_speed,
+                                current_time=current_time,
+                            ))
             else:
                 if process.stdout:
                     process.stdout.read()

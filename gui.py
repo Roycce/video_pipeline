@@ -4,10 +4,12 @@ Stream Auto Cutter — GUI Module.
 Main application window and widgets using PySide6.
 """
 
+import time
+import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,6 +24,8 @@ from vk_uploader import VkUploader
 from queue_manager import QueueManager, TaskStatus
 from settings import Settings
 from profiles import ProfileManager
+from gpu_detector import detect_available_encoders
+from ffmpeg_handler import get_ffmpeg_path
 
 
 
@@ -326,13 +330,31 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.progress_overall, stretch=1)
         
         bottom_layout.addLayout(controls_layout)
+
+        # ETA / speed / chunks info line
+        self.lbl_eta = QLabel("")
+        self.lbl_eta.setStyleSheet("color: #a0a0a0; font-size: 12px; padding: 2px 4px;")
+        bottom_layout.addWidget(self.lbl_eta)
+
         main_layout.addLayout(bottom_layout)
+
+        # Queue timing
+        self._queue_start_time: float = 0.0
+        self._available_encoders: dict = {}
+
+        # Elapsed-time timer (ticks every second while processing)
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         # Load settings to UI
         self._load_settings_to_ui()
         
         # Connect settings changes to save
         self._connect_ui_to_settings()
+
+        # Auto-detect GPU encoders in background
+        self._detect_gpu_encoders()
 
     # ------------------------------------------------------------------
     # UI Creation
@@ -864,6 +886,102 @@ class MainWindow(QMainWindow):
         self.vk_max_spin.valueChanged.connect(self._save_ui_to_settings)
 
     # ------------------------------------------------------------------
+    # GPU Detection & Elapsed Timer
+    # ------------------------------------------------------------------
+
+    def _detect_gpu_encoders(self):
+        """Run GPU encoder detection in a background thread."""
+        def _worker():
+            try:
+                self._available_encoders = detect_available_encoders(get_ffmpeg_path())
+            except Exception:
+                self._available_encoders = {}
+            # Schedule UI update on the main thread
+            QTimer.singleShot(0, self._on_encoders_detected)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+    def _on_encoders_detected(self):
+        """Update codec combo: mark unavailable encoders."""
+        if not self._available_encoders:
+            return
+        for i in range(self.cb_codec.count()):
+            codec_val = self.cb_codec.itemData(i)
+            if codec_val in self._available_encoders:
+                if not self._available_encoders[codec_val]:
+                    txt = self.cb_codec.itemText(i)
+                    if "(недоступен)" not in txt:
+                        self.cb_codec.setItemText(i, f"{txt} (недоступен)")
+
+    def _update_elapsed(self):
+        """Called every second by _elapsed_timer while processing."""
+        tasks = self.queue_manager.get_tasks()
+        if not tasks:
+            return
+
+        # Overall elapsed since queue started
+        elapsed = time.time() - self._queue_start_time if self._queue_start_time else 0
+
+        # Total chunks across ALL files (all probed upfront, so num_segments is accurate)
+        total_chunks = sum(t.num_segments for t in tasks)
+        done_chunks = 0
+        for t in tasks:
+            if t.status == TaskStatus.DONE:
+                done_chunks += t.num_segments
+            elif t.status == TaskStatus.PROCESSING:
+                done_chunks += t.current_segment  # completed segments in active task
+
+        # Current encoding speed (from the active task)
+        current_speed = 0.0
+        for t in tasks:
+            if t.status == TaskStatus.PROCESSING and t.speed > 0:
+                current_speed = t.speed
+                break
+
+        # ---- Total queue ETA ----
+        # All files already probed → t.duration is known for every task
+        total_eta = 0.0
+        for t in tasks:
+            if t.status == TaskStatus.PROCESSING:
+                # remaining video seconds in this task / encoding speed
+                total_eta += t.eta_sec
+            elif t.status == TaskStatus.PENDING:
+                # entire file still waiting — use current speed
+                if current_speed > 0:
+                    total_eta += t.duration / current_speed
+
+        # Total video remaining (for display)
+        total_video_remaining = 0.0
+        for t in tasks:
+            if t.status == TaskStatus.PROCESSING:
+                total_video_remaining += t.duration * (1.0 - t.progress / 100.0)
+            elif t.status == TaskStatus.PENDING:
+                total_video_remaining += t.duration
+
+        parts = []
+        parts.append(f"Кусков: {done_chunks}/{total_chunks}")
+        parts.append(f"Прошло: {self._fmt_duration(elapsed)}")
+        if total_eta > 0:
+            parts.append(f"Осталось: ~{self._fmt_duration(total_eta)}")
+        if current_speed > 0:
+            parts.append(f"Скорость: {current_speed:.1f}x")
+        if total_video_remaining > 0:
+            parts.append(f"Видео: {self._fmt_duration(total_video_remaining)}")
+
+        self.lbl_eta.setText("  |  ".join(parts))
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Format seconds into HH:MM:SS or MM:SS."""
+        s = int(seconds)
+        h, remainder = divmod(s, 3600)
+        m, sec = divmod(remainder, 60)
+        if h:
+            return f"{h}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    # ------------------------------------------------------------------
     # UI Logic & Events
     # ------------------------------------------------------------------
     
@@ -1133,6 +1251,10 @@ class MainWindow(QMainWindow):
         
         self.log_text.clear()
         self._log_message("Запуск обработки...")
+        self.lbl_eta.setText("")
+        
+        self._queue_start_time = time.time()
+        self._elapsed_timer.start()
         
         self.queue_manager.start_processing(self.settings.get_all())
         
@@ -1178,7 +1300,14 @@ class MainWindow(QMainWindow):
             self.table.item(row, 1).setText(dur_str)
             
         self.table.item(row, 2).setText(t.status.value)
-        self.table.item(row, 3).setText(f"{t.progress:.1f}%")
+        # Show [Кусок X/Y] Z% in progress column
+        if t.num_segments > 0 and t.status == TaskStatus.PROCESSING:
+            seg_display = t.current_segment + 1
+            self.table.item(row, 3).setText(
+                f"[{seg_display}/{t.num_segments}] {t.progress:.1f}%"
+            )
+        else:
+            self.table.item(row, 3).setText(f"{t.progress:.1f}%")
         
     def _on_task_progress(self, task_idx: int, seg_idx: int, percent: float):
         self._on_task_updated(task_idx)
@@ -1196,7 +1325,20 @@ class MainWindow(QMainWindow):
             self._log_message(f"Ошибка задачи {task_idx}: {msg}")
             
     def _on_queue_completed(self):
-        self._log_message("Обработка всей очереди завершена.")
+        self._elapsed_timer.stop()
+        elapsed = time.time() - self._queue_start_time if self._queue_start_time else 0
+
+        tasks = self.queue_manager.get_tasks()
+        total_chunks = sum(t.num_segments for t in tasks)
+
+        self._log_message(
+            f"Обработка всей очереди завершена. "
+            f"Кусков: {total_chunks}, Время: {self._fmt_duration(elapsed)}"
+        )
+        self.lbl_eta.setText(
+            f"✅ Готово  |  Кусков: {total_chunks}  |  "
+            f"Общее время: {self._fmt_duration(elapsed)}"
+        )
         
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
