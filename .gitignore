@@ -234,11 +234,23 @@ patch_*.py
 test_build.py
 
 # Local config (раскомментируй если не хочешь пушить)
-# Sensitive / local config — не должны попадать в репозиторий
+# Local config / logs / output
 settings.json
 profiles.json
 titles.txt
 *.log
+debug_log.txt
 progress.json
+output/
 
-# profiles.json
+# Media files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# Patch & test scripts
+patch_*.py
+test_*.py
+
