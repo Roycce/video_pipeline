@@ -46,6 +46,10 @@ DEFAULT_SETTINGS = {
     "vk_video_folder": "",       # папка с готовыми видео
     "vk_delay_sec": 10,
     "vk_max_videos": 150,
+
+    # --- Presets ---
+    "presets": {},               # {name: {setting_key: value, ...}}
+    "active_preset": None,       # имя активного пресета или None
 }
 
 
@@ -110,4 +114,60 @@ class Settings:
     def reset(self) -> None:
         """Reset all settings to defaults and save."""
         self._data = dict(DEFAULT_SETTINGS)
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Presets
+    # ------------------------------------------------------------------
+
+    # Keys that belong to a preset (processing settings, not VK account).
+    PRESET_KEYS = (
+        "segment_duration_min",
+        "intro_path", "intro_enabled",
+        "outro_path", "outro_enabled",
+        "logo_enabled", "logos",
+        "resolution", "custom_resolution_w", "custom_resolution_h",
+        "fps", "codec",
+        "file_size_limit_enabled", "file_size_limit_mb", "audio_bitrate",
+        "output_subfolder",
+    )
+
+    def get_preset_names(self) -> list:
+        """Return sorted list of saved preset names."""
+        return sorted(self._data.get("presets", {}).keys())
+
+    def save_preset(self, name: str, data: dict | None = None) -> None:
+        """Save current settings (or *data*) as a named preset."""
+        if data is None:
+            data = {k: self._data[k] for k in self.PRESET_KEYS if k in self._data}
+        presets = self._data.setdefault("presets", {})
+        presets[name] = data
+        self._data["active_preset"] = name
+        self.save()
+
+    def load_preset(self, name: str) -> dict | None:
+        """Return the data dict for a preset, or None if not found."""
+        return self._data.get("presets", {}).get(name)
+
+    def delete_preset(self, name: str) -> None:
+        """Delete a preset by name."""
+        presets = self._data.get("presets", {})
+        presets.pop(name, None)
+        if self._data.get("active_preset") == name:
+            self._data["active_preset"] = None
+        self.save()
+
+    def rename_preset(self, old_name: str, new_name: str) -> None:
+        """Rename a preset."""
+        presets = self._data.get("presets", {})
+        if old_name not in presets:
+            return
+        presets[new_name] = presets.pop(old_name)
+        if self._data.get("active_preset") == old_name:
+            self._data["active_preset"] = new_name
+        self.save()
+
+    def set_active_preset(self, name) -> None:
+        """Remember which preset is currently selected."""
+        self._data["active_preset"] = name
         self.save()
