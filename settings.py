@@ -39,6 +39,15 @@ DEFAULT_SETTINGS = {
     # --- Output ---
     "output_subfolder": "output",
 
+    # --- Shorts ---
+    "shorts_enabled": False,
+    "shorts_resolution": "1080x1920",   # "1080x1920" or "720x1280"
+    "shorts_fit": "blur_sides",         # "crop_center", "blur_sides", "black_bars"
+
+    # --- Sound Overlay ---
+    "sound_overlay_enabled": False,
+    "sound_overlays": [],               # list of overlay dicts
+
     # --- VK Uploader ---
     "vk_token": "",
     "vk_group_id": "",           # пустая строка = личная страница
@@ -130,6 +139,8 @@ class Settings:
         "fps", "codec",
         "file_size_limit_enabled", "file_size_limit_mb", "audio_bitrate",
         "output_subfolder",
+        "shorts_enabled", "shorts_resolution", "shorts_fit",
+        "sound_overlay_enabled", "sound_overlays",
     )
 
     def get_preset_names(self) -> list:
