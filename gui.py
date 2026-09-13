@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QTabWidget, QGroupBox, QLabel, QComboBox, QSpinBox,
     QPushButton, QCheckBox, QSlider, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QTextEdit, QProgressBar, QMessageBox,
-    QSplitter, QDialog, QDialogButtonBox, QListWidget, QLineEdit
+    QSplitter, QDialog, QDialogButtonBox, QListWidget, QLineEdit,
+    QInputDialog
 )
 
 from vk_uploader import VkUploader
@@ -275,15 +276,19 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        
+
+        # Presets bar (above tabs)
+        self._preset_loading = False  # guard to avoid recursive saves
+        right_layout.addLayout(self._build_presets_bar())
+
         self.tabs = QTabWidget()
-        
+
         self.tab_cut = self._create_cut_tab()
         self.tab_io = self._create_io_tab()
         self.tab_logo = self._create_logo_tab()
         self.tab_video = self._create_video_tab()
         self.tab_vk = self._create_vk_tab()
-        
+
         self.tabs.addTab(self.tab_cut, "Нарезка")
         self.tabs.addTab(self.tab_io, "Интро/Аутро")
         self.tabs.addTab(self.tab_logo, "Логотип")
@@ -292,10 +297,10 @@ class MainWindow(QMainWindow):
 
         # VK uploader worker
         self._vk_uploader: VkUploader | None = None
-        
+
         right_layout.addWidget(self.tabs)
         splitter.addWidget(right_panel)
-        
+
         splitter.setSizes([400, 400])
 
         # Bottom panel: Log and Progress
@@ -1259,11 +1264,166 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
 
     # ------------------------------------------------------------------
+    # Presets
+    # ------------------------------------------------------------------
+
+    def _build_presets_bar(self) -> QHBoxLayout:
+        """Build and return the horizontal presets toolbar layout."""
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        bar.addWidget(QLabel("🎛 Пресет:"))
+
+        self.cb_presets = QComboBox()
+        self.cb_presets.setMinimumWidth(160)
+        self.cb_presets.setToolTip("Выберите пресет для загрузки настроек")
+        bar.addWidget(self.cb_presets, stretch=1)
+
+        btn_save = QPushButton("💾 Сохранить")
+        btn_save.setToolTip("Сохранить текущие настройки как пресет")
+        btn_save.clicked.connect(self._action_save_preset)
+        bar.addWidget(btn_save)
+
+        btn_rename = QPushButton("✏️ Переименовать")
+        btn_rename.setToolTip("Переименовать выбранный пресет")
+        btn_rename.clicked.connect(self._action_rename_preset)
+        bar.addWidget(btn_rename)
+
+        btn_delete = QPushButton("🗑 Удалить")
+        btn_delete.setToolTip("Удалить выбранный пресет")
+        btn_delete.clicked.connect(self._action_delete_preset)
+        bar.addWidget(btn_delete)
+
+        # Fill combo and connect signal AFTER creating buttons
+        self._refresh_presets_combo(select_name=self.settings.get("active_preset"))
+        self.cb_presets.currentIndexChanged.connect(self._on_preset_selected)
+
+        return bar
+
+    def _refresh_presets_combo(self, select_name: str | None = None):
+        """Repopulate the presets combo box, optionally selecting *select_name*."""
+        self.cb_presets.blockSignals(True)
+        self.cb_presets.clear()
+        self.cb_presets.addItem("— не выбрано —", None)
+        for name in self.settings.get_preset_names():
+            self.cb_presets.addItem(name, name)
+        # Restore selection
+        if select_name:
+            idx = self.cb_presets.findData(select_name)
+            if idx >= 0:
+                self.cb_presets.setCurrentIndex(idx)
+        self.cb_presets.blockSignals(False)
+
+    def _on_preset_selected(self, combo_idx: int):
+        """Load the selected preset into the UI."""
+        name = self.cb_presets.itemData(combo_idx)
+        if not name:
+            self.settings.set_active_preset(None)
+            return
+        data = self.settings.load_preset(name)
+        if data is None:
+            return
+        self._preset_loading = True
+        try:
+            self._load_preset_data_to_ui(data)
+        finally:
+            self._preset_loading = False
+        self.settings.set_active_preset(name)
+
+    def _action_save_preset(self):
+        """Save current settings as a new or existing preset."""
+        # Pre-fill with active preset name if one is selected
+        current_name = self.cb_presets.currentData() or ""
+        name, ok = QInputDialog.getText(
+            self, "Сохранить пресет",
+            "Имя пресета:", text=current_name
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self._save_ui_to_settings()
+        self.settings.save_preset(name)
+        self._refresh_presets_combo(select_name=name)
+
+    def _action_rename_preset(self):
+        """Rename the currently selected preset."""
+        old_name = self.cb_presets.currentData()
+        if not old_name:
+            QMessageBox.warning(self, "Пресеты", "Сначала выберите пресет для переименования.")
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Переименовать пресет",
+            "Новое имя:", text=old_name
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == old_name:
+            return
+        self.settings.rename_preset(old_name, new_name)
+        self._refresh_presets_combo(select_name=new_name)
+
+    def _action_delete_preset(self):
+        """Delete the currently selected preset after confirmation."""
+        name = self.cb_presets.currentData()
+        if not name:
+            QMessageBox.warning(self, "Пресеты", "Сначала выберите пресет для удаления.")
+            return
+        reply = QMessageBox.question(
+            self, "Удалить пресет",
+            f"Удалить пресет «{name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.settings.delete_preset(name)
+        self._refresh_presets_combo()
+
+    def _load_preset_data_to_ui(self, data: dict):
+        """Apply a preset data dict to all UI widgets (without saving to settings file)."""
+        # Cut
+        dur = data.get("segment_duration_min", 16)
+        dur_map = {5: 0, 10: 1, 16: 2, 20: 3, 30: 4}
+        if dur in dur_map:
+            self.cb_duration.setCurrentIndex(dur_map[dur])
+            self.spin_duration.setValue(dur)
+        else:
+            self.cb_duration.setCurrentIndex(5)
+            self.spin_duration.setValue(dur)
+
+        # IO
+        self.chk_intro.setChecked(data.get("intro_enabled", False))
+        self.chk_outro.setChecked(data.get("outro_enabled", False))
+        self.lbl_intro_path.setText(data.get("intro_path", "") or "Путь не выбран")
+        self.lbl_outro_path.setText(data.get("outro_path", "") or "Путь не выбран")
+
+        # Logo
+        self.chk_logo.setChecked(data.get("logo_enabled", False))
+        self._logos_data = list(data.get("logos", []))
+        self._refresh_logos_list()
+
+        # Video
+        self.cb_res.setCurrentText(data.get("resolution", "source"))
+        self.spin_res_w.setValue(data.get("custom_resolution_w", 1920))
+        self.spin_res_h.setValue(data.get("custom_resolution_h", 1080))
+        self.cb_fps.setCurrentText(data.get("fps", "source"))
+        codec_val = data.get("codec", "libx264")
+        idx = self.cb_codec.findData(codec_val)
+        if idx >= 0:
+            self.cb_codec.setCurrentIndex(idx)
+
+        # Persist loaded preset data into the main settings so processing picks it up
+        self.settings.update({k: v for k, v in data.items()})
+
+
+    # ------------------------------------------------------------------
     # Drag and Drop
     # ------------------------------------------------------------------
     # To properly handle drag & drop we would override dragEnterEvent
     # and dropEvent on the table or main window. For simplicity, we can
     # leave it as a quick implementation if needed, but it's requested.
+
     
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
