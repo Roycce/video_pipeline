@@ -266,7 +266,7 @@ class FFmpegHandler:
         logos = []
         if settings.get("logo_enabled", False):
             logos = settings.get("logos", [])
-        
+
         logo_indices = []
         for logo in logos:
             path = logo.get("path")
@@ -280,6 +280,16 @@ class FFmpegHandler:
                 logo_indices.append(idx)
                 idx += 1
 
+        # ---- sound overlay inputs ----
+        sound_overlays = []
+        sound_indices = []
+        if settings.get("sound_overlay_enabled", False):
+            sound_overlays = [s for s in settings.get("sound_overlays", []) if s.get("path")]
+        for sov in sound_overlays:
+            inputs += ["-i", str(sov["path"])]
+            sound_indices.append(idx)
+            idx += 1
+
         # ---- hardware acceleration ----
         hw_args = []
         codec = settings.get("codec", "h264_nvenc")
@@ -292,7 +302,9 @@ class FFmpegHandler:
         needs_logo = len(logo_indices) > 0
         needs_scale = settings.get("resolution", "source") != "source"
         needs_fps = target_fps is not None
-        needs_filter = needs_concat or needs_logo or needs_scale or needs_fps
+        needs_shorts = settings.get("shorts_enabled", False)
+        needs_sound = len(sound_indices) > 0
+        needs_filter = needs_concat or needs_logo or needs_scale or needs_fps or needs_shorts or needs_sound
 
         # ---- total output duration (for bitrate calc) ----
         total_output_duration = segment_duration + intro_duration + outro_duration
@@ -454,6 +466,71 @@ class FFmpegHandler:
             if ":" not in video_out:
                 filters.append(f"[{video_out}]format=yuv420p[outv]")
                 video_out = "outv"
+
+        # ---- shorts / vertical video ----
+        if needs_shorts:
+            fit = settings.get("shorts_fit", "blur_sides")
+            res = settings.get("shorts_resolution", "1080x1920")
+            try:
+                sw, sh = (int(v) for v in res.split("x"))
+            except Exception:
+                sw, sh = 1080, 1920
+
+            # wrap direct stream ref so we can chain
+            if ":" in video_out:
+                filters.append(f"[{video_out}]null[vshorts_in]")
+                video_out = "vshorts_in"
+
+            if fit == "crop_center":
+                filters.append(
+                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                    f"crop={sw}:{sh},format=yuv420p[vshorts]"
+                )
+            elif fit == "black_bars":
+                filters.append(
+                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
+                    f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[vshorts]"
+                )
+            else:  # blur_sides (default)
+                # background: scale to fill, blur heavily
+                filters.append(
+                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                    f"crop={sw}:{sh},boxblur=20:5[vbg]"
+                )
+                # foreground: fit inside, keep aspect
+                filters.append(
+                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=decrease[vfg]"
+                )
+                filters.append(
+                    f"[vbg][vfg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vshorts]"
+                )
+            video_out = "vshorts"
+
+        # ---- sound overlay (amix) ----
+        if needs_sound:
+            # wrap audio ref if needed
+            if not audio_labeled:
+                filters.append(f"[{audio_out}]acopy[amain]")
+                audio_out = "amain"
+                audio_labeled = True
+
+            current_audio = audio_out
+            for i, (sov, si) in enumerate(zip(sound_overlays, sound_indices)):
+                delay_ms = int(sov.get("start_sec", 0) * 1000)
+                vol = float(sov.get("volume", 0.8))
+                loop_flag = "-stream_loop -1" if sov.get("loop", False) else ""
+                next_audio = f"amixed{i}"
+                # adelay shifts overlay to desired timestamp; amix blends with original
+                filters.append(
+                    f"[{si}:a]adelay={delay_ms}|{delay_ms},"
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[sov{i}]"
+                )
+                filters.append(
+                    f"[{current_audio}][sov{i}]amix=inputs=2:duration=first:"
+                    f"weights='1 {vol:.2f}'[{next_audio}]"
+                )
+                current_audio = next_audio
+            audio_out = current_audio
 
         # ---- assemble command ----
         cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs
