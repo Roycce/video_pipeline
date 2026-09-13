@@ -191,8 +191,93 @@ class LogoEditDialog(QDialog):
             "time_end": self.spin_tend.value(),
         }
 
+
+class SoundOverlayDialog(QDialog):
+    """Диалог настройки одного звукового оверлея."""
+
+    def __init__(self, parent=None, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройка звукового оверлея")
+        self.setMinimumWidth(380)
+        self._data = data or {
+            "path": "",
+            "start_sec": 0,
+            "volume": 0.8,
+            "loop": False,
+        }
+        self._init_ui()
+        self._load_data()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Path
+        h_path = QHBoxLayout()
+        self.lbl_path = QLabel("Путь не выбран")
+        self.lbl_path.setWordWrap(True)
+        btn_browse = QPushButton("Обзор...")
+        btn_browse.clicked.connect(self._browse)
+        h_path.addWidget(self.lbl_path, stretch=1)
+        h_path.addWidget(btn_browse)
+        layout.addLayout(h_path)
+
+        # Start sec
+        h_start = QHBoxLayout()
+        h_start.addWidget(QLabel("Старт (сек от начала сегмента):"))
+        self.spin_start = QSpinBox()
+        self.spin_start.setRange(0, 7200)
+        self.spin_start.setSuffix(" с")
+        h_start.addWidget(self.spin_start)
+        layout.addLayout(h_start)
+
+        # Volume
+        h_vol = QHBoxLayout()
+        h_vol.addWidget(QLabel("Громкость (%):"))
+        self.spin_vol = QSpinBox()
+        self.spin_vol.setRange(0, 200)
+        self.spin_vol.setSuffix(" %")
+        h_vol.addWidget(self.spin_vol)
+        layout.addLayout(h_vol)
+
+        # Loop
+        self.chk_loop = QCheckBox("Зациклить до конца видео")
+        layout.addWidget(self.chk_loop)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _browse(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать аудиофайл", "",
+            "Аудио (*.mp3 *.wav *.aac *.ogg *.m4a *.flac)"
+        )
+        if f:
+            self.lbl_path.setText(f)
+
+    def _load_data(self):
+        p = self._data.get("path", "")
+        self.lbl_path.setText(p or "Путь не выбран")
+        self.spin_start.setValue(int(self._data.get("start_sec", 0)))
+        self.spin_vol.setValue(int(self._data.get("volume", 0.8) * 100))
+        self.chk_loop.setChecked(bool(self._data.get("loop", False)))
+
+    def get_data(self) -> dict:
+        path = self.lbl_path.text()
+        return {
+            "path": "" if path == "Путь не выбран" else path,
+            "start_sec": self.spin_start.value(),
+            "volume": round(self.spin_vol.value() / 100.0, 2),
+            "loop": self.chk_loop.isChecked(),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: Settings):
+
         super().__init__()
         self.settings = settings
 
@@ -287,12 +372,14 @@ class MainWindow(QMainWindow):
         self.tab_io = self._create_io_tab()
         self.tab_logo = self._create_logo_tab()
         self.tab_video = self._create_video_tab()
+        self.tab_sound = self._create_sound_tab()
         self.tab_vk = self._create_vk_tab()
 
         self.tabs.addTab(self.tab_cut, "Нарезка")
         self.tabs.addTab(self.tab_io, "Интро/Аутро")
         self.tabs.addTab(self.tab_logo, "Логотип")
         self.tabs.addTab(self.tab_video, "Видео")
+        self.tabs.addTab(self.tab_sound, "🔊 Аудио")
         self.tabs.addTab(self.tab_vk, "ВКонтакте")
 
         # VK uploader worker
@@ -500,10 +587,10 @@ class MainWindow(QMainWindow):
     def _create_video_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
+
         grp = QGroupBox("Настройки видео")
         glayout = QVBoxLayout(grp)
-        
+
         # Resolution
         h_res = QHBoxLayout()
         h_res.addWidget(QLabel("Разрешение:"))
@@ -511,7 +598,7 @@ class MainWindow(QMainWindow):
         self.cb_res.addItems(["source", "1280x720", "1920x1080", "2560x1440", "3840x2160", "custom"])
         self.cb_res.currentIndexChanged.connect(self._on_res_changed)
         h_res.addWidget(self.cb_res)
-        
+
         self.spin_res_w = QSpinBox()
         self.spin_res_w.setRange(320, 7680)
         self.spin_res_w.setVisible(False)
@@ -522,7 +609,7 @@ class MainWindow(QMainWindow):
         h_res.addWidget(self.spin_res_h)
         h_res.addStretch()
         glayout.addLayout(h_res)
-        
+
         # FPS
         h_fps = QHBoxLayout()
         h_fps.addWidget(QLabel("FPS:"))
@@ -531,7 +618,7 @@ class MainWindow(QMainWindow):
         h_fps.addWidget(self.cb_fps)
         h_fps.addStretch()
         glayout.addLayout(h_fps)
-        
+
         # Codec
         h_codec = QHBoxLayout()
         h_codec.addWidget(QLabel("Кодек:"))
@@ -545,13 +632,101 @@ class MainWindow(QMainWindow):
         h_codec.addWidget(self.cb_codec)
         h_codec.addStretch()
         glayout.addLayout(h_codec)
-        
+
         layout.addWidget(grp)
+
+        # ---- Shorts group ----
+        grp_shorts = QGroupBox("Shorts / Вертикальное видео")
+        sl = QVBoxLayout(grp_shorts)
+
+        self.chk_shorts = QCheckBox("Конвертировать в Shorts (9:16 вертикальное)")
+        sl.addWidget(self.chk_shorts)
+
+        h_sres = QHBoxLayout()
+        h_sres.addWidget(QLabel("Разрешение:"))
+        self.cb_shorts_res = QComboBox()
+        self.cb_shorts_res.addItems(["1080x1920", "720x1280"])
+        h_sres.addWidget(self.cb_shorts_res)
+        h_sres.addStretch()
+        sl.addLayout(h_sres)
+
+        h_sfit = QHBoxLayout()
+        h_sfit.addWidget(QLabel("Режим:"))
+        self.cb_shorts_fit = QComboBox()
+        self.cb_shorts_fit.addItem("Размытый фон по бокам", "blur_sides")
+        self.cb_shorts_fit.addItem("Обрезка по центру", "crop_center")
+        self.cb_shorts_fit.addItem("Чёрные полосы", "black_bars")
+        h_sfit.addWidget(self.cb_shorts_fit)
+        h_sfit.addStretch()
+        sl.addLayout(h_sfit)
+
+        layout.addWidget(grp_shorts)
         layout.addStretch()
         return widget
 
 
+    def _create_sound_tab(self) -> QWidget:
+        """Вкладка наложения звука поверх оригинальной дорожки."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
 
+        self.chk_sound = QCheckBox("Наложить звук поверх оригинала")
+        layout.addWidget(self.chk_sound)
+
+        self.list_sounds = QListWidget()
+        layout.addWidget(self.list_sounds)
+
+        h_btns = QHBoxLayout()
+        btn_add_snd = QPushButton("Добавить")
+        btn_add_snd.clicked.connect(self._action_add_sound)
+        h_btns.addWidget(btn_add_snd)
+
+        btn_edit_snd = QPushButton("Изменить")
+        btn_edit_snd.clicked.connect(self._action_edit_sound)
+        h_btns.addWidget(btn_edit_snd)
+
+        btn_del_snd = QPushButton("Удалить")
+        btn_del_snd.clicked.connect(self._action_remove_sound)
+        h_btns.addWidget(btn_del_snd)
+
+        layout.addLayout(h_btns)
+
+        self._sounds_data = []
+        return widget
+
+    def _refresh_sounds_list(self):
+        self.list_sounds.clear()
+        for i, sd in enumerate(self._sounds_data):
+            p = sd.get("path", "")
+            name = Path(p).name if p else "Не выбран"
+            start = sd.get("start_sec", 0)
+            vol = int(sd.get("volume", 0.8) * 100)
+            loop_s = " 🔁" if sd.get("loop") else ""
+            self.list_sounds.addItem(f"{i+1}. {name}  |  старт: {start}с  |  громк: {vol}%{loop_s}")
+
+    def _action_add_sound(self):
+        dlg = SoundOverlayDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._sounds_data.append(dlg.get_data())
+            self._refresh_sounds_list()
+            self._save_ui_to_settings()
+
+    def _action_edit_sound(self):
+        r = self.list_sounds.currentRow()
+        if r < 0 or r >= len(self._sounds_data):
+            return
+        dlg = SoundOverlayDialog(self, self._sounds_data[r])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._sounds_data[r] = dlg.get_data()
+            self._refresh_sounds_list()
+            self._save_ui_to_settings()
+
+    def _action_remove_sound(self):
+        r = self.list_sounds.currentRow()
+        if 0 <= r < len(self._sounds_data):
+            del self._sounds_data[r]
+            self._refresh_sounds_list()
+            self._save_ui_to_settings()
 
 
     def _create_vk_tab(self) -> QWidget:
@@ -754,15 +929,24 @@ class MainWindow(QMainWindow):
         self.spin_res_w.setValue(s.get("custom_resolution_w", 1920))
         self.spin_res_h.setValue(s.get("custom_resolution_h", 1080))
         self.cb_fps.setCurrentText(s.get("fps", "source"))
-        
+
         codec_val = s.get("codec", "h264_nvenc")
         idx = self.cb_codec.findData(codec_val)
         if idx >= 0:
             self.cb_codec.setCurrentIndex(idx)
         else:
             self.cb_codec.setCurrentIndex(0)
-            
 
+        # Shorts
+        self.chk_shorts.setChecked(s.get("shorts_enabled", False))
+        self.cb_shorts_res.setCurrentText(s.get("shorts_resolution", "1080x1920"))
+        fit_idx = self.cb_shorts_fit.findData(s.get("shorts_fit", "blur_sides"))
+        self.cb_shorts_fit.setCurrentIndex(fit_idx if fit_idx >= 0 else 0)
+
+        # Sound overlay
+        self.chk_sound.setChecked(s.get("sound_overlay_enabled", False))
+        self._sounds_data = list(s.get("sound_overlays", []))
+        self._refresh_sounds_list()
 
         # VK
         self.vk_token_edit.setText(s.get("vk_token", ""))
@@ -797,8 +981,15 @@ class MainWindow(QMainWindow):
         s.set("custom_resolution_h", self.spin_res_h.value())
         s.set("fps", self.cb_fps.currentText())
         s.set("codec", self.cb_codec.currentData())
-        
 
+        # Shorts
+        s.set("shorts_enabled", self.chk_shorts.isChecked())
+        s.set("shorts_resolution", self.cb_shorts_res.currentText())
+        s.set("shorts_fit", self.cb_shorts_fit.currentData())
+
+        # Sound overlay
+        s.set("sound_overlay_enabled", self.chk_sound.isChecked())
+        s.set("sound_overlays", self._sounds_data)
 
         # VK
         s.set("vk_token", self.vk_token_edit.text().strip())
@@ -822,8 +1013,14 @@ class MainWindow(QMainWindow):
         self.spin_res_h.valueChanged.connect(self._save_ui_to_settings)
         self.cb_fps.currentIndexChanged.connect(self._save_ui_to_settings)
         self.cb_codec.currentIndexChanged.connect(self._save_ui_to_settings)
-        
 
+        # Shorts
+        self.chk_shorts.toggled.connect(self._save_ui_to_settings)
+        self.cb_shorts_res.currentIndexChanged.connect(self._save_ui_to_settings)
+        self.cb_shorts_fit.currentIndexChanged.connect(self._save_ui_to_settings)
+
+        # Sound overlay
+        self.chk_sound.toggled.connect(self._save_ui_to_settings)
 
         # VK
         self.vk_token_edit.textChanged.connect(self._save_ui_to_settings)
@@ -1413,8 +1610,20 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.cb_codec.setCurrentIndex(idx)
 
+        # Shorts
+        self.chk_shorts.setChecked(data.get("shorts_enabled", False))
+        self.cb_shorts_res.setCurrentText(data.get("shorts_resolution", "1080x1920"))
+        fit_idx = self.cb_shorts_fit.findData(data.get("shorts_fit", "blur_sides"))
+        self.cb_shorts_fit.setCurrentIndex(fit_idx if fit_idx >= 0 else 0)
+
+        # Sound overlay
+        self.chk_sound.setChecked(data.get("sound_overlay_enabled", False))
+        self._sounds_data = list(data.get("sound_overlays", []))
+        self._refresh_sounds_list()
+
         # Persist loaded preset data into the main settings so processing picks it up
         self.settings.update({k: v for k, v in data.items()})
+
 
 
     # ------------------------------------------------------------------
