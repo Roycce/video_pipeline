@@ -625,6 +625,10 @@ class MainWindow(QMainWindow):
         self.cb_codec = QComboBox()
         self.cb_codec.addItem("h264_nvenc (NVIDIA)", "h264_nvenc")
         self.cb_codec.addItem("hevc_nvenc (NVIDIA)", "hevc_nvenc")
+        self.cb_codec.addItem("h264_qsv (Intel QuickSync)", "h264_qsv")
+        self.cb_codec.addItem("hevc_qsv (Intel QuickSync)", "hevc_qsv")
+        self.cb_codec.addItem("h264_amf (AMD)", "h264_amf")
+        self.cb_codec.addItem("hevc_amf (AMD)", "hevc_amf")
         self.cb_codec.addItem("h264_videotoolbox (Mac)", "h264_videotoolbox")
         self.cb_codec.addItem("hevc_videotoolbox (Mac)", "hevc_videotoolbox")
         self.cb_codec.addItem("libx264 (Процессор)", "libx264")
@@ -632,6 +636,18 @@ class MainWindow(QMainWindow):
         h_codec.addWidget(self.cb_codec)
         h_codec.addStretch()
         glayout.addLayout(h_codec)
+
+        # Parallel Workers
+        h_workers = QHBoxLayout()
+        h_workers.addWidget(QLabel("Параллельные потоки:"))
+        self.cb_workers = QComboBox()
+        self.cb_workers.addItem("1 поток (последовательно)", 1)
+        self.cb_workers.addItem("2 потока (рекомендуется)", 2)
+        self.cb_workers.addItem("3 потока (для мощных GPU)", 3)
+        self.cb_workers.addItem("4 потока", 4)
+        h_workers.addWidget(self.cb_workers)
+        h_workers.addStretch()
+        glayout.addLayout(h_workers)
 
         layout.addWidget(grp)
 
@@ -937,6 +953,10 @@ class MainWindow(QMainWindow):
         else:
             self.cb_codec.setCurrentIndex(0)
 
+        workers_val = s.get("parallel_workers", 2)
+        w_idx = self.cb_workers.findData(workers_val)
+        self.cb_workers.setCurrentIndex(w_idx if w_idx >= 0 else 1)
+
         # Shorts
         self.chk_shorts.setChecked(s.get("shorts_enabled", False))
         self.cb_shorts_res.setCurrentText(s.get("shorts_resolution", "1080x1920"))
@@ -981,6 +1001,7 @@ class MainWindow(QMainWindow):
         s.set("custom_resolution_h", self.spin_res_h.value())
         s.set("fps", self.cb_fps.currentText())
         s.set("codec", self.cb_codec.currentData())
+        s.set("parallel_workers", self.cb_workers.currentData() or 2)
 
         # Shorts
         s.set("shorts_enabled", self.chk_shorts.isChecked())
@@ -1013,6 +1034,7 @@ class MainWindow(QMainWindow):
         self.spin_res_h.valueChanged.connect(self._save_ui_to_settings)
         self.cb_fps.currentIndexChanged.connect(self._save_ui_to_settings)
         self.cb_codec.currentIndexChanged.connect(self._save_ui_to_settings)
+        self.cb_workers.currentIndexChanged.connect(self._save_ui_to_settings)
 
         # Shorts
         self.chk_shorts.toggled.connect(self._save_ui_to_settings)
@@ -1609,6 +1631,11 @@ class MainWindow(QMainWindow):
         idx = self.cb_codec.findData(codec_val)
         if idx >= 0:
             self.cb_codec.setCurrentIndex(idx)
+
+        if "parallel_workers" in data:
+            w_idx = self.cb_workers.findData(data["parallel_workers"])
+            if w_idx >= 0:
+                self.cb_workers.setCurrentIndex(w_idx)
 
         # Shorts
         self.chk_shorts.setChecked(data.get("shorts_enabled", False))

@@ -10,10 +10,11 @@ from __future__ import annotations
 import math
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
-from ffmpeg_handler import FFmpegHandler, ProgressInfo
+from ffmpeg_handler import FFmpegHandler, ProgressInfo, CancelledError
 
 
 class VideoProcessor:
@@ -105,72 +106,91 @@ class VideoProcessor:
         output_dir = source_dir / settings.get("output_subfolder", "output")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        temp_dir = output_dir / ".temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
         stem = Path(stream_path).stem
+        max_workers = max(1, int(settings.get("parallel_workers", 2)))
+        _log(f"  Режим кодирования: {max_workers} параллельных поток{'а' if max_workers < 5 else 'ов'}")
 
-        # 6. Process each segment
-        try:
-            for seg_idx, (start, dur) in enumerate(segments):
-                # ---- pause / cancel ----
-                self._wait_if_paused(pause_check, cancel_event)
-                if cancel_event and cancel_event.is_set():
-                    _log("⏹ Обработка отменена")
-                    return
+        # 6. Process segments in parallel (Zero-Disk Temp)
+        lock = threading.Lock()
+        progress_state: dict[int, dict[str, float]] = {
+            i: {"pct": 0.0, "speed": 0.0} for i in range(n_segments)
+        }
 
-                _log(f"▶ Сегмент {seg_idx + 1}/{n_segments}  "
-                     f"[{self._fmt_time(start)} → {self._fmt_time(start + dur)}]")
+        def _report_progress(active_idx: int):
+            with lock:
+                total_pct = sum(s["pct"] for s in progress_state.values()) / n_segments
+                total_speed = sum(s["speed"] for s in progress_state.values() if s["pct"] < 100.0)
+            if progress_callback:
+                progress_callback(active_idx, n_segments, total_pct, total_speed)
 
-                # ---- split (stream copy) ----
-                temp_path = temp_dir / f"{stem}_seg{seg_idx + 1:03d}.mp4"
-                split_cmd = self._ffmpeg.build_split_command(
-                    str(stream_path), start, dur, str(temp_path),
-                )
-                self._ffmpeg.run_command(split_cmd, cancel_event=cancel_event)
+        def _process_one_segment(seg_idx: int, start: float, dur: float):
+            self._wait_if_paused(pause_check, cancel_event)
+            if cancel_event and cancel_event.is_set():
+                return
 
-                # ---- build & run processing command ----
-                part_num = seg_idx + 1
-                out_path = output_dir / f"{stem}_part{part_num:02d}.mp4"
+            part_num = seg_idx + 1
+            out_path = output_dir / f"{stem}_part{part_num:02d}.mp4"
+            _log(f"▶ Сегмент {part_num}/{n_segments}  "
+                 f"[{self._fmt_time(start)} → {self._fmt_time(start + dur)}]")
 
-                total_out_dur = dur + intro_dur + outro_dur
+            total_out_dur = dur + intro_dur + outro_dur
 
-                proc_cmd = self._ffmpeg.build_processing_command(
-                    segment_path=str(temp_path),
-                    output_path=str(out_path),
-                    settings=settings,
-                    intro_path=intro_path,
-                    outro_path=outro_path,
-                    segment_duration=dur,
-                    target_w=target_w,
-                    target_h=target_h,
-                    target_fps=str(target_fps) if target_fps else None,
-                    intro_duration=intro_dur,
-                    outro_duration=outro_dur,
-                )
+            proc_cmd = self._ffmpeg.build_processing_command(
+                segment_path=str(stream_path),
+                output_path=str(out_path),
+                settings=settings,
+                intro_path=intro_path,
+                outro_path=outro_path,
+                segment_duration=dur,
+                target_w=target_w,
+                target_h=target_h,
+                target_fps=str(target_fps) if target_fps else None,
+                intro_duration=intro_dur,
+                outro_duration=outro_dur,
+                start_sec=start,
+            )
 
-                def _on_progress(info: ProgressInfo, _si=seg_idx):
-                    if progress_callback:
-                        progress_callback(_si, n_segments, info.percent, info.speed)
+            def _on_progress(info: ProgressInfo):
+                with lock:
+                    progress_state[seg_idx]["pct"] = info.percent
+                    progress_state[seg_idx]["speed"] = info.speed
+                _report_progress(seg_idx)
 
-                self._ffmpeg.run_command(
-                    proc_cmd,
-                    total_duration=total_out_dur,
-                    progress_callback=_on_progress,
-                    cancel_event=cancel_event,
-                )
+            self._ffmpeg.run_command(
+                proc_cmd,
+                total_duration=total_out_dur,
+                progress_callback=_on_progress,
+                cancel_event=cancel_event,
+            )
 
-                # cleanup temp segment
-                temp_path.unlink(missing_ok=True)
-                _log(f"  ✓ Часть {part_num} готова → {out_path.name}")
+            with lock:
+                progress_state[seg_idx]["pct"] = 100.0
+                progress_state[seg_idx]["speed"] = 0.0
+            _report_progress(seg_idx)
+            _log(f"  ✓ Часть {part_num} готова → {out_path.name}")
 
-        finally:
-            # cleanup temp dir (if empty)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_one_segment, seg_idx, start, dur): seg_idx
+                for seg_idx, (start, dur) in enumerate(segments)
+            }
             try:
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-            except OSError:
-                pass
+                for future in as_completed(futures):
+                    if cancel_event and cancel_event.is_set():
+                        for f in futures:
+                            f.cancel()
+                    future.result()
+            except CancelledError:
+                _log("⏹ Обработка отменена")
+                return
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
+
+        if cancel_event and cancel_event.is_set():
+            _log("⏹ Обработка отменена")
+            return
 
         _log(f"✅ {Path(stream_path).name} — обработка завершена "
              f"({n_segments} частей)")

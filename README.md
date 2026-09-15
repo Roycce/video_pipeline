@@ -1,4 +1,4 @@
-# 🎬 Stream Auto Cutter v2.2.0
+# 🎬 Stream Auto Cutter v3.0.0
 
 <p align="center">
   <img src="icon.png" width="128" height="128" alt="Stream Auto Cutter Icon" />
@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.2.0-blueviolet?style=for-the-badge" alt="Version 2.2.0" />
+  <img src="https://img.shields.io/badge/Version-3.0.0-blueviolet?style=for-the-badge" alt="Version 3.0.0" />
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-007ACC?style=for-the-badge" alt="Platforms" />
-  <img src="https://img.shields.io/badge/GPU_Accelerated-CUDA%20%7C%20VideoToolbox-success?style=for-the-badge" alt="GPU Acceleration" />
+  <img src="https://img.shields.io/badge/GPU_Accelerated-CUDA%20%7C%20QSV%20%7C%20AMF%20%7C%20VideoToolbox-success?style=for-the-badge" alt="GPU Acceleration" />
   <img src="https://img.shields.io/badge/FFmpeg-Embedded-orange?style=for-the-badge" alt="FFmpeg Embedded" />
 </p>
 

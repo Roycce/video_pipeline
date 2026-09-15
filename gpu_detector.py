@@ -18,6 +18,10 @@ _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _ENCODERS_TO_TEST: list[str] = [
     "h264_nvenc",
     "hevc_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "h264_amf",
+    "hevc_amf",
     "h264_videotoolbox",
     "hevc_videotoolbox",
 ]
@@ -88,6 +92,8 @@ def best_available_encoder(
     # Priority order
     fallback_order = [
         "h264_nvenc", "hevc_nvenc",
+        "h264_qsv", "hevc_qsv",
+        "h264_amf", "hevc_amf",
         "h264_videotoolbox", "hevc_videotoolbox",
     ]
     for enc in fallback_order:

@@ -38,6 +38,7 @@ DEFAULT_SETTINGS = {
 
     # --- Output ---
     "output_subfolder": "output",
+    "parallel_workers": 2,              # 1 (последовательно), 2 (рекомендуется для GPU), 3, etc.
 
     # --- Shorts ---
     "shorts_enabled": False,
@@ -138,7 +139,7 @@ class Settings:
         "resolution", "custom_resolution_w", "custom_resolution_h",
         "fps", "codec",
         "file_size_limit_enabled", "file_size_limit_mb", "audio_bitrate",
-        "output_subfolder",
+        "output_subfolder", "parallel_workers",
         "shorts_enabled", "shorts_resolution", "shorts_fit",
         "sound_overlay_enabled", "sound_overlays",
     )

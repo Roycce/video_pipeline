@@ -189,18 +189,16 @@ class QueueManager(QThread):
                 _task.current_segment = seg_idx
                 _task.num_segments = total_segs
                 _task.speed = speed
-                _task.progress = (
-                    (seg_idx + pct / 100.0) / total_segs * 100.0
-                )
+                _task.progress = max(_task.progress, min(100.0, pct))
                 _task.elapsed_sec = time.time() - _task.start_time
                 # ETA for remaining video in this task based on encoding speed
                 if speed > 0 and _task.duration > 0:
                     processed_video_sec = _task.duration * _task.progress / 100.0
-                    remaining_video_sec = _task.duration - processed_video_sec
+                    remaining_video_sec = max(0.0, _task.duration - processed_video_sec)
                     _task.eta_sec = remaining_video_sec / speed
                 else:
                     _task.eta_sec = 0.0
-                self.task_progress.emit(_i, seg_idx, pct)
+                self.task_progress.emit(_i, seg_idx, _task.progress)
                 self.task_updated.emit(_i)
 
             def _on_log(msg: str) -> None:

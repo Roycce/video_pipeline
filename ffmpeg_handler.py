@@ -20,11 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-# Hide console window on Windows; give FFmpeg child processes high priority
-if sys.platform == "win32":
-    _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.HIGH_PRIORITY_CLASS
-else:
-    _CREATION_FLAGS = 0
+# Hide console window on Windows
+_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 class FFmpegError(RuntimeError):
@@ -239,10 +236,12 @@ class FFmpegHandler:
         target_fps: str | None = None,
         intro_duration: float = 0.0,
         outro_duration: float = 0.0,
+        start_sec: float | None = None,
     ) -> list[str]:
         """
         Build a single FFmpeg command that combines:
         concat (intro + segment + outro) → scale/fps → logo overlay → encode.
+        If start_sec is provided, seeking is done directly on the input stream.
         """
         # ---- inputs ----
         inputs: list[str] = []
@@ -254,7 +253,10 @@ class FFmpegHandler:
             indices["intro"] = idx
             idx += 1
 
-        inputs += ["-i", str(segment_path)]
+        if start_sec is not None:
+            inputs += ["-ss", f"{start_sec:.3f}", "-t", f"{segment_duration:.3f}", "-i", str(segment_path)]
+        else:
+            inputs += ["-i", str(segment_path)]
         indices["segment"] = idx
         idx += 1
 
@@ -295,6 +297,8 @@ class FFmpegHandler:
         codec = settings.get("codec", "h264_nvenc")
         if "nvenc" in codec:
             hw_args = ["-hwaccel", "cuda"]
+        elif "qsv" in codec:
+            hw_args = ["-hwaccel", "qsv"]
         elif "videotoolbox" in codec:
             hw_args = ["-hwaccel", "videotoolbox"]
 
@@ -341,7 +345,7 @@ class FFmpegHandler:
                 vl = f"v{key}"
                 al = f"a{key}"
                 filters.append(
-                    f"[{i}:v]scale={target_w}:{target_h}"
+                    f"[{i}:v]scale={target_w}:{target_h}:flags=bicubic"
                     f":force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
                     f"format=yuv420p,setsar=1{fps_suffix}[{vl}]"
@@ -369,7 +373,7 @@ class FFmpegHandler:
             si = indices["segment"]
             if needs_scale or needs_fps:
                 filters.append(
-                    f"[{si}:v]scale={target_w}:{target_h}"
+                    f"[{si}:v]scale={target_w}:{target_h}:flags=bicubic"
                     f":force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
                     f"format=yuv420p,setsar=1{fps_suffix}[vprocessed]"
@@ -492,10 +496,16 @@ class FFmpegHandler:
                     f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[vshorts]"
                 )
             else:  # blur_sides (default)
-                # background: scale to fill, blur heavily
+                # background: Fast Downsample Blur (8x downscale -> light blur -> upscale)
+                # ~15-20x faster than full-resolution boxblur=20:5
+                bw = max(64, sw // 8)
+                bh = max(64, sh // 8)
                 filters.append(
                     f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
-                    f"crop={sw}:{sh},boxblur=20:5[vbg]"
+                    f"crop={sw}:{sh},"
+                    f"scale={bw}:{bh}:flags=fast_bilinear,"
+                    f"boxblur=3:1,"
+                    f"scale={sw}:{sh}:flags=bicubic[vbg]"
                 )
                 # foreground: fit inside, keep aspect
                 filters.append(
@@ -562,7 +572,13 @@ class FFmpegHandler:
         codec = settings.get("codec", "h264_nvenc")
 
         # Auto-fallback: if a GPU codec was chosen but is unavailable, switch to CPU
-        if codec in ("h264_nvenc", "hevc_nvenc", "h264_videotoolbox", "hevc_videotoolbox"):
+        gpu_codecs = (
+            "h264_nvenc", "hevc_nvenc",
+            "h264_qsv", "hevc_qsv",
+            "h264_amf", "hevc_amf",
+            "h264_videotoolbox", "hevc_videotoolbox",
+        )
+        if codec in gpu_codecs:
             from gpu_detector import detect_available_encoders
             avail = detect_available_encoders(get_ffmpeg_path())
             if not avail.get(codec, False):
@@ -582,6 +598,16 @@ class FFmpegHandler:
                          "-maxrate", f"{int(br * 1.5)}k",
                          "-bufsize", f"{int(br * 2)}k",
                          "-preset", "p2"]
+            elif "qsv" in codec:
+                args += ["-b:v", f"{br}k",
+                         "-maxrate", f"{int(br * 1.5)}k",
+                         "-bufsize", f"{int(br * 2)}k",
+                         "-preset", "veryfast"]
+            elif "amf" in codec:
+                args += ["-b:v", f"{br}k",
+                         "-maxrate", f"{int(br * 1.5)}k",
+                         "-bufsize", f"{int(br * 2)}k",
+                         "-quality", "speed"]
             elif "videotoolbox" in codec:
                 args += ["-b:v", f"{br}k"]
             else:
@@ -592,8 +618,15 @@ class FFmpegHandler:
         else:
             if "nvenc" in codec:
                 args += ["-preset", "p2", "-tune", "hq", "-cq", "23"]
+            elif "qsv" in codec:
+                args += ["-preset", "veryfast", "-global_quality", "23"]
+            elif "amf" in codec:
+                args += ["-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
             elif "videotoolbox" in codec:
-                args += ["-q:v", "65", "-tag:v", "hvc1"]
+                if "hevc" in codec or "265" in codec:
+                    args += ["-q:v", "65", "-tag:v", "hvc1"]
+                else:
+                    args += ["-q:v", "65"]
             else:
                 args += ["-crf", "22", "-preset", "veryfast"]
 
