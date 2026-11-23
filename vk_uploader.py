@@ -143,7 +143,7 @@ class VkUploader(QThread):
 
                 # --- После успешной загрузки ---
                 self._move_to_uploaded(filepath)
-                self._pop_first_title()
+                self._remove_title(title)
 
             except Exception as e:
                 err_str = str(e)
@@ -184,8 +184,8 @@ class VkUploader(QThread):
         except Exception as e:
             self._log(f"   ⚠ Не удалось переместить файл: {e}")
 
-    def _pop_first_title(self) -> None:
-        """Удаляет первую строку из titles.txt после успешной загрузки."""
+    def _remove_title(self, title: str) -> None:
+        """Удаляет использованный заголовок из titles.txt после успешной загрузки."""
         if not self._titles_path:
             return
         path = Path(self._titles_path)
@@ -193,8 +193,12 @@ class VkUploader(QThread):
             return
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
-            # Убираем первую непустую строку
-            remaining = lines[1:] if lines else []
+            target = title.strip()
+            remaining = list(lines)
+            for j, line in enumerate(lines):
+                if line.strip() == target:
+                    del remaining[j]  # только первое совпадение
+                    break
             path.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
         except Exception as e:
             self._log(f"   ⚠ Не удалось обновить titles.txt: {e}")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from typing import Dict
 
 # Hide console window on Windows
@@ -27,6 +28,7 @@ _ENCODERS_TO_TEST: list[str] = [
 ]
 
 _cache: Dict[str, bool] | None = None
+_cache_lock = threading.Lock()
 
 
 def _test_encoder(encoder: str, ffmpeg_path: str = "ffmpeg") -> bool:
@@ -63,15 +65,16 @@ def detect_available_encoders(
     subsequent calls return the cached result unless *force_refresh* is set.
     """
     global _cache
-    if _cache is not None and not force_refresh:
-        return dict(_cache)
+    with _cache_lock:
+        if _cache is not None and not force_refresh:
+            return dict(_cache)
 
-    result: Dict[str, bool] = {}
-    for enc in _ENCODERS_TO_TEST:
-        result[enc] = _test_encoder(enc, ffmpeg_path)
+        result: Dict[str, bool] = {}
+        for enc in _ENCODERS_TO_TEST:
+            result[enc] = _test_encoder(enc, ffmpeg_path)
 
-    _cache = result
-    return dict(result)
+        _cache = result
+        return dict(result)
 
 
 def best_available_encoder(

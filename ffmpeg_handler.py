@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -237,12 +238,44 @@ class FFmpegHandler:
         intro_duration: float = 0.0,
         outro_duration: float = 0.0,
         start_sec: float | None = None,
+        segment_has_audio: bool = True,
+        intro_has_audio: bool = True,
+        outro_has_audio: bool = True,
     ) -> list[str]:
         """
         Build a single FFmpeg command that combines:
         concat (intro + segment + outro) → scale/fps → logo overlay → encode.
         If start_sec is provided, seeking is done directly on the input stream.
         """
+        # ---- logos / sound overlays (filter out entries without a path) ----
+        logos: list[dict] = []
+        if settings.get("logo_enabled", False):
+            logos = [l for l in settings.get("logos", []) if l.get("path")]
+
+        sound_overlays: list[dict] = []
+        if settings.get("sound_overlay_enabled", False):
+            sound_overlays = [s for s in settings.get("sound_overlays", []) if s.get("path")]
+
+        needs_concat = bool(intro_path or outro_path)
+        needs_logo = bool(logos)
+        needs_scale = settings.get("resolution", "source") != "source"
+        needs_fps = target_fps is not None
+        needs_shorts = settings.get("shorts_enabled", False)
+        needs_sound = bool(sound_overlays)
+        needs_filter = needs_concat or needs_logo or needs_scale or needs_fps or needs_shorts or needs_sound
+        stream_copy = not needs_filter and not settings.get("file_size_limit_enabled")
+
+        # ---- hardware decoding (input option: applies only to the next -i) ----
+        hw_args: list[str] = []
+        if not stream_copy:
+            codec = settings.get("codec", "h264_nvenc")
+            if "nvenc" in codec:
+                hw_args = ["-hwaccel", "cuda"]
+            elif "qsv" in codec:
+                hw_args = ["-hwaccel", "qsv"]
+            elif "videotoolbox" in codec:
+                hw_args = ["-hwaccel", "videotoolbox"]
+
         # ---- inputs ----
         inputs: list[str] = []
         idx = 0
@@ -253,6 +286,7 @@ class FFmpegHandler:
             indices["intro"] = idx
             idx += 1
 
+        inputs += hw_args
         if start_sec is not None:
             inputs += ["-ss", f"{start_sec:.3f}", "-t", f"{segment_duration:.3f}", "-i", str(segment_path)]
         else:
@@ -265,62 +299,35 @@ class FFmpegHandler:
             indices["outro"] = idx
             idx += 1
 
-        logos = []
-        if settings.get("logo_enabled", False):
-            logos = settings.get("logos", [])
-
-        logo_indices = []
+        logo_inputs: list[tuple[dict, int]] = []
         for logo in logos:
-            path = logo.get("path")
-            if path:
-                if logo.get("type") == "video_chromakey":
-                    inputs += ["-stream_loop", "-1"]
-                else:
-                    # image logo: loop it infinitely so it covers the whole video
-                    inputs += ["-loop", "1"]
-                inputs += ["-i", str(path)]
-                logo_indices.append(idx)
-                idx += 1
-
-        # ---- sound overlay inputs ----
-        sound_overlays = []
-        sound_indices = []
-        if settings.get("sound_overlay_enabled", False):
-            sound_overlays = [s for s in settings.get("sound_overlays", []) if s.get("path")]
-        for sov in sound_overlays:
-            inputs += ["-i", str(sov["path"])]
-            sound_indices.append(idx)
+            if logo.get("type") == "video_chromakey":
+                inputs += ["-stream_loop", "-1"]
+            # image logo: single frame, held by overlay eof_action=repeat
+            inputs += ["-i", str(logo["path"])]
+            logo_inputs.append((logo, idx))
             idx += 1
 
-        # ---- hardware acceleration ----
-        hw_args = []
-        codec = settings.get("codec", "h264_nvenc")
-        if "nvenc" in codec:
-            hw_args = ["-hwaccel", "cuda"]
-        elif "qsv" in codec:
-            hw_args = ["-hwaccel", "qsv"]
-        elif "videotoolbox" in codec:
-            hw_args = ["-hwaccel", "videotoolbox"]
-
-        needs_concat = "intro" in indices or "outro" in indices
-        needs_logo = len(logo_indices) > 0
-        needs_scale = settings.get("resolution", "source") != "source"
-        needs_fps = target_fps is not None
-        needs_shorts = settings.get("shorts_enabled", False)
-        needs_sound = len(sound_indices) > 0
-        needs_filter = needs_concat or needs_logo or needs_scale or needs_fps or needs_shorts or needs_sound
+        # ---- sound overlay inputs ----
+        sound_inputs: list[tuple[dict, int]] = []
+        for sov in sound_overlays:
+            if sov.get("loop", False):
+                inputs += ["-stream_loop", "-1"]
+            inputs += ["-i", str(sov["path"])]
+            sound_inputs.append((sov, idx))
+            idx += 1
 
         # ---- total output duration (for bitrate calc) ----
         total_output_duration = segment_duration + intro_duration + outro_duration
 
         # ---- instant stream copy path (no filter & no bitrate restriction) ----
-        if not needs_filter and not settings.get("file_size_limit_enabled"):
-            cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs + ["-c", "copy", str(output_path)]
+        if stream_copy:
+            cmd = [get_ffmpeg_path(), "-y"] + inputs + ["-c", "copy", str(output_path)]
             return cmd
 
         # ---- simple encoding path (no filtergraph) ----
         if not needs_filter:
-            cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs
+            cmd = [get_ffmpeg_path(), "-y"] + inputs
             cmd += self._encoding_args(settings, total_output_duration)
             cmd.append(str(output_path))
             return cmd
@@ -338,6 +345,16 @@ class FFmpegHandler:
             # normalise every concat input to identical resolution / fps / pixfmt
             concat_v_labels = []
             concat_a_labels = []
+            has_audio_map = {
+                "intro": intro_has_audio,
+                "segment": segment_has_audio,
+                "outro": outro_has_audio,
+            }
+            dur_map = {
+                "intro": intro_duration,
+                "segment": segment_duration,
+                "outro": outro_duration,
+            }
             for key in ("intro", "segment", "outro"):
                 if key not in indices:
                     continue
@@ -350,10 +367,17 @@ class FFmpegHandler:
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
                     f"format=yuv420p,setsar=1{fps_suffix}[{vl}]"
                 )
-                filters.append(
-                    f"[{i}:a]aresample=44100,"
-                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[{al}]"
-                )
+                if has_audio_map[key]:
+                    filters.append(
+                        f"[{i}:a]aresample=44100,"
+                        f"aformat=sample_fmts=fltp:channel_layouts=stereo[{al}]"
+                    )
+                else:
+                    # no audio track — substitute silence of the same length
+                    filters.append(
+                        f"anullsrc=r=44100:cl=stereo,atrim=duration={dur_map[key]:.3f},"
+                        f"aformat=sample_fmts=fltp:channel_layouts=stereo[{al}]"
+                    )
                 concat_v_labels.append(vl)
                 concat_a_labels.append(al)
 
@@ -381,7 +405,10 @@ class FFmpegHandler:
                 video_out = "vprocessed"
             else:
                 video_out = f"{si}:v"
-            audio_out = f"{si}:a"
+            if segment_has_audio:
+                audio_out = f"{si}:a"
+            else:
+                audio_out = ""  # no audio track at all
             audio_labeled = False
 
         # ---- logo overlay ----
@@ -391,10 +418,7 @@ class FFmpegHandler:
                 filters.append(f"[{video_out}]null[vbase]")
                 video_out = "vbase"
 
-            for i, (logo, li) in enumerate(zip(logos, logo_indices)):
-                if not logo.get("path"):
-                    continue
-                    
+            for i, (logo, li) in enumerate(logo_inputs):
                 logo_size_pct = logo.get("size", 15) / 100.0
                 logo_opacity = logo.get("opacity", 80) / 100.0
                 position = logo.get("position", "top_right")
@@ -458,11 +482,13 @@ class FFmpegHandler:
                     )
 
                 next_out = f"outv{i}"
-                is_last = (i == len(logo_indices) - 1)
+                is_last = (i == len(logo_inputs) - 1)
                 fmt = ",format=yuv420p" if is_last else ""
-                
+                # image: one frame, repeat it; looped chromakey video: pass
+                eof = "pass" if logo.get("type") == "video_chromakey" else "repeat"
+
                 filters.append(
-                    f"[{video_out}][{logo_lbl}]overlay={ox}:{oy}:eof_action=pass{enable}{fmt}[{next_out}]"
+                    f"[{video_out}][{logo_lbl}]overlay={ox}:{oy}:eof_action={eof}{enable}{fmt}[{next_out}]"
                 )
                 video_out = next_out
         else:
@@ -480,11 +506,6 @@ class FFmpegHandler:
             except Exception:
                 sw, sh = 1080, 1920
 
-            # wrap direct stream ref so we can chain
-            if ":" in video_out:
-                filters.append(f"[{video_out}]null[vshorts_in]")
-                video_out = "vshorts_in"
-
             if fit == "crop_center":
                 filters.append(
                     f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
@@ -500,8 +521,10 @@ class FFmpegHandler:
                 # ~15-20x faster than full-resolution boxblur=20:5
                 bw = max(64, sw // 8)
                 bh = max(64, sh // 8)
+                # a filter output label can be consumed only once — split it
+                filters.append(f"[{video_out}]split=2[vsh_bg][vsh_fg]")
                 filters.append(
-                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                    f"[vsh_bg]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
                     f"crop={sw}:{sh},"
                     f"scale={bw}:{bh}:flags=fast_bilinear,"
                     f"boxblur=3:1,"
@@ -509,7 +532,7 @@ class FFmpegHandler:
                 )
                 # foreground: fit inside, keep aspect
                 filters.append(
-                    f"[{video_out}]scale={sw}:{sh}:force_original_aspect_ratio=decrease[vfg]"
+                    f"[vsh_fg]scale={sw}:{sh}:force_original_aspect_ratio=decrease[vfg]"
                 )
                 filters.append(
                     f"[vbg][vfg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vshorts]"
@@ -519,16 +542,22 @@ class FFmpegHandler:
         # ---- sound overlay (amix) ----
         if needs_sound:
             # wrap audio ref if needed
-            if not audio_labeled:
+            if not audio_out:
+                # stream has no audio — mix overlays over silence
+                filters.append(
+                    f"anullsrc=r=44100:cl=stereo,atrim=duration={total_output_duration:.3f}[amain]"
+                )
+                audio_out = "amain"
+                audio_labeled = True
+            elif not audio_labeled:
                 filters.append(f"[{audio_out}]acopy[amain]")
                 audio_out = "amain"
                 audio_labeled = True
 
             current_audio = audio_out
-            for i, (sov, si) in enumerate(zip(sound_overlays, sound_indices)):
+            for i, (sov, si) in enumerate(sound_inputs):
                 delay_ms = int(sov.get("start_sec", 0) * 1000)
                 vol = float(sov.get("volume", 0.8))
-                loop_flag = "-stream_loop -1" if sov.get("loop", False) else ""
                 next_audio = f"amixed{i}"
                 # adelay shifts overlay to desired timestamp; amix blends with original
                 filters.append(
@@ -536,14 +565,14 @@ class FFmpegHandler:
                     f"aformat=sample_fmts=fltp:channel_layouts=stereo[sov{i}]"
                 )
                 filters.append(
-                    f"[{current_audio}][sov{i}]amix=inputs=2:duration=first:"
+                    f"[{current_audio}][sov{i}]amix=inputs=2:duration=first:normalize=0:"
                     f"weights='1 {vol:.2f}'[{next_audio}]"
                 )
                 current_audio = next_audio
             audio_out = current_audio
 
         # ---- assemble command ----
-        cmd = [get_ffmpeg_path(), "-y"] + hw_args + inputs
+        cmd = [get_ffmpeg_path(), "-y"] + inputs
         cmd += ["-filter_complex", ";".join(filters)]
 
         # map video
@@ -552,10 +581,10 @@ class FFmpegHandler:
         else:
             cmd += ["-map", f"[{video_out}]"]
 
-        # map audio
+        # map audio (skip entirely if there is none)
         if audio_labeled:
             cmd += ["-map", f"[{audio_out}]"]
-        else:
+        elif audio_out:
             cmd += ["-map", audio_out]
 
         cmd += self._encoding_args(settings, total_output_duration)
@@ -566,25 +595,33 @@ class FFmpegHandler:
     # Encoding helpers
     # ------------------------------------------------------------------
 
+    _GPU_CODECS = (
+        "h264_nvenc", "hevc_nvenc",
+        "h264_qsv", "hevc_qsv",
+        "h264_amf", "hevc_amf",
+        "h264_videotoolbox", "hevc_videotoolbox",
+    )
+
+    def resolve_codec(self, codec: str) -> tuple[str, bool]:
+        """
+        Return ``(usable_codec, fell_back)``. If *codec* is a GPU encoder
+        that is not available on this machine, the CPU equivalent is returned
+        and ``fell_back`` is True.
+        """
+        if codec not in self._GPU_CODECS:
+            return codec, False
+        from gpu_detector import detect_available_encoders
+        avail = detect_available_encoders(get_ffmpeg_path())
+        if avail.get(codec, False):
+            return codec, False
+        fallback = "libx265" if ("hevc" in codec or "265" in codec) else "libx264"
+        return fallback, True
+
     def _encoding_args(self, settings: dict, duration: float) -> list[str]:
         """Return the encoding portion of an FFmpeg command."""
         args: list[str] = ["-threads", "0"]
+        # codec availability is resolved once per stream (see resolve_codec)
         codec = settings.get("codec", "h264_nvenc")
-
-        # Auto-fallback: if a GPU codec was chosen but is unavailable, switch to CPU
-        gpu_codecs = (
-            "h264_nvenc", "hevc_nvenc",
-            "h264_qsv", "hevc_qsv",
-            "h264_amf", "hevc_amf",
-            "h264_videotoolbox", "hevc_videotoolbox",
-        )
-        if codec in gpu_codecs:
-            from gpu_detector import detect_available_encoders
-            avail = detect_available_encoders(get_ffmpeg_path())
-            if not avail.get(codec, False):
-                fallback = "libx265" if ("hevc" in codec or "265" in codec) else "libx264"
-                codec = fallback
-
         args += ["-c:v", codec]
 
         if settings.get("file_size_limit_enabled") and settings.get("file_size_limit_mb"):
@@ -617,7 +654,7 @@ class FFmpegHandler:
                          "-preset", "veryfast"]
         else:
             if "nvenc" in codec:
-                args += ["-preset", "p2", "-tune", "hq", "-cq", "23"]
+                args += ["-preset", "p2", "-tune", "hq", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
             elif "qsv" in codec:
                 args += ["-preset", "veryfast", "-global_quality", "23"]
             elif "amf" in codec:
@@ -644,9 +681,13 @@ class FFmpegHandler:
         total_duration: float | None = None,
         progress_callback: Callable[[ProgressInfo], None] | None = None,
         cancel_event: threading.Event | None = None,
+        abort_event: threading.Event | None = None,
     ) -> None:
         """
         Execute an FFmpeg command.
+
+        A watcher thread polls *cancel_event* / *abort_event* every 0.2 s and
+        terminates FFmpeg as soon as either is set, raising CancelledError.
 
         If *total_duration* and *progress_callback* are provided the method
         uses ``-progress pipe:1`` to report real-time progress via
@@ -677,18 +718,33 @@ class FFmpegHandler:
         err_thread = threading.Thread(target=_drain_stderr, daemon=True)
         err_thread.start()
 
+        # watch for cancellation independently of FFmpeg's output
+        stop_events = [e for e in (cancel_event, abort_event) if e is not None]
+        cancelled = threading.Event()
+
+        def _watch_cancel():
+            while process.poll() is None:
+                if any(e.is_set() for e in stop_events):
+                    cancelled.set()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return
+                time.sleep(0.2)
+
+        watch_thread = None
+        if stop_events:
+            watch_thread = threading.Thread(target=_watch_cancel, daemon=True)
+            watch_thread.start()
+
         try:
             if use_progress:
                 assert process.stdout is not None
                 current_time = 0.0
                 current_speed = 0.0
                 for raw_line in iter(process.stdout.readline, b""):
-                    # cancellation check
-                    if cancel_event and cancel_event.is_set():
-                        process.terminate()
-                        process.wait(timeout=10)
-                        raise CancelledError("Обработка отменена пользователем")
-
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if line.startswith("out_time="):
                         time_str = line.split("=", 1)[1]
@@ -715,14 +771,17 @@ class FFmpegHandler:
                     process.stdout.read()
 
             process.wait()
-        except CancelledError:
-            raise
         except Exception:
             process.kill()
             process.wait()
             raise
         finally:
+            if watch_thread is not None:
+                watch_thread.join(timeout=15)
             err_thread.join(timeout=5)
+
+        if cancelled.is_set():
+            raise CancelledError("Обработка отменена")
 
         if process.returncode != 0:
             tail = "".join(stderr_lines[-30:])

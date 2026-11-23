@@ -5,6 +5,7 @@ Handles loading, saving, and validating application settings.
 Settings are stored in a JSON file next to the application.
 """
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -73,7 +74,7 @@ class Settings:
             else:
                 config_path = Path(__file__).parent / "settings.json"
         self._path = Path(config_path)
-        self._data: dict = dict(DEFAULT_SETTINGS)
+        self._data: dict = copy.deepcopy(DEFAULT_SETTINGS)
         self.load()
 
     # ------------------------------------------------------------------
@@ -123,7 +124,7 @@ class Settings:
 
     def reset(self) -> None:
         """Reset all settings to defaults and save."""
-        self._data = dict(DEFAULT_SETTINGS)
+        self._data = copy.deepcopy(DEFAULT_SETTINGS)
         self.save()
 
     # ------------------------------------------------------------------

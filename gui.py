@@ -937,7 +937,7 @@ class MainWindow(QMainWindow):
         
         # Logo
         self.chk_logo.setChecked(s.get("logo_enabled", False))
-        self._logos_data = s.get("logos", [])
+        self._logos_data = list(s.get("logos", []))
         self._refresh_logos_list()
         
         # Video

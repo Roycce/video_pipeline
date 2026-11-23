@@ -75,20 +75,36 @@ class VideoProcessor:
             f"{source_info['fps']} fps"
         )
 
+        # 1b. Resolve codec once: warn loudly if the GPU encoder is unavailable
+        codec = settings.get("codec", "h264_nvenc")
+        resolved_codec, fell_back = self._ffmpeg.resolve_codec(codec)
+        if fell_back:
+            _log(f"  ⚠ Кодек {codec} недоступен, кодирую на CPU ({resolved_codec}). "
+                 f"Обнови драйвер видеокарты.")
+        settings = dict(settings)
+        settings["codec"] = resolved_codec
+
         # 2. Resolve intro / outro
         intro_path = self._resolve_asset(settings, "intro")
         outro_path = self._resolve_asset(settings, "outro")
 
         intro_dur = 0.0
         outro_dur = 0.0
+        intro_has_audio = True
+        outro_has_audio = True
         if intro_path:
             self._intro_info = self._ffmpeg.probe_video(intro_path)
             intro_dur = self._intro_info["duration"]
-            _log(f"  Интро: {intro_dur:.1f} сек")
+            intro_has_audio = self._intro_info.get("has_audio", True)
+            _log(f"  Интро: {intro_dur:.1f} сек" + ("" if intro_has_audio else " (без звука)"))
         if outro_path:
             self._outro_info = self._ffmpeg.probe_video(outro_path)
             outro_dur = self._outro_info["duration"]
-            _log(f"  Аутро: {outro_dur:.1f} сек")
+            outro_has_audio = self._outro_info.get("has_audio", True)
+            _log(f"  Аутро: {outro_dur:.1f} сек" + ("" if outro_has_audio else " (без звука)"))
+        segment_has_audio = source_info.get("has_audio", True)
+        if not segment_has_audio:
+            _log("  ⚠ В стриме нет звуковой дорожки")
 
         # 3. Calculate segments
         seg_min = settings.get("segment_duration_min", 16)
@@ -112,6 +128,7 @@ class VideoProcessor:
 
         # 6. Process segments in parallel (Zero-Disk Temp)
         lock = threading.Lock()
+        abort = threading.Event()  # set when any segment fails
         progress_state: dict[int, dict[str, float]] = {
             i: {"pct": 0.0, "speed": 0.0} for i in range(n_segments)
         }
@@ -125,7 +142,7 @@ class VideoProcessor:
 
         def _process_one_segment(seg_idx: int, start: float, dur: float):
             self._wait_if_paused(pause_check, cancel_event)
-            if cancel_event and cancel_event.is_set():
+            if (cancel_event and cancel_event.is_set()) or abort.is_set():
                 return
 
             part_num = seg_idx + 1
@@ -148,6 +165,9 @@ class VideoProcessor:
                 intro_duration=intro_dur,
                 outro_duration=outro_dur,
                 start_sec=start,
+                segment_has_audio=segment_has_audio,
+                intro_has_audio=intro_has_audio,
+                outro_has_audio=outro_has_audio,
             )
 
             def _on_progress(info: ProgressInfo):
@@ -156,12 +176,18 @@ class VideoProcessor:
                     progress_state[seg_idx]["speed"] = info.speed
                 _report_progress(seg_idx)
 
-            self._ffmpeg.run_command(
-                proc_cmd,
-                total_duration=total_out_dur,
-                progress_callback=_on_progress,
-                cancel_event=cancel_event,
-            )
+            try:
+                self._ffmpeg.run_command(
+                    proc_cmd,
+                    total_duration=total_out_dur,
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_event,
+                    abort_event=abort,
+                )
+            except BaseException:
+                # remove the half-written file (cancel or error)
+                out_path.unlink(missing_ok=True)
+                raise
 
             with lock:
                 progress_state[seg_idx]["pct"] = 100.0
@@ -174,19 +200,24 @@ class VideoProcessor:
                 executor.submit(_process_one_segment, seg_idx, start, dur): seg_idx
                 for seg_idx, (start, dur) in enumerate(segments)
             }
-            try:
-                for future in as_completed(futures):
-                    if cancel_event and cancel_event.is_set():
+            first_error: BaseException | None = None
+            for future in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                try:
+                    future.result()
+                except CancelledError:
+                    pass  # cancelled by user or aborted due to another segment's error
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
+                        abort.set()
                         for f in futures:
                             f.cancel()
-                    future.result()
-            except CancelledError:
-                _log("⏹ Обработка отменена")
-                return
-            except Exception:
-                for f in futures:
-                    f.cancel()
-                raise
+
+        if first_error is not None:
+            raise first_error
 
         if cancel_event and cancel_event.is_set():
             _log("⏹ Обработка отменена")
