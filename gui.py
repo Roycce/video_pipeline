@@ -4,191 +4,406 @@ Stream Auto Cutter — GUI Module.
 Main application window and widgets using PySide6.
 """
 
+from __future__ import annotations
+
+import os
+import re
 import sys
 import time
 import threading
 from pathlib import Path
-from typing import Optional
 
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QStandardPaths
+from PySide6.QtGui import QIcon, QPainter, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QGroupBox, QLabel, QComboBox, QSpinBox,
-    QPushButton, QCheckBox, QSlider, QTableWidget, QTableWidgetItem,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QTabWidget, QGroupBox, QLabel, QComboBox, QSpinBox, QRadioButton,
+    QPushButton, QCheckBox, QTableWidget, QTableWidgetItem, QSizePolicy,
     QHeaderView, QFileDialog, QTextEdit, QProgressBar, QMessageBox,
     QSplitter, QDialog, QDialogButtonBox, QListWidget, QLineEdit,
-    QInputDialog
+    QInputDialog, QAbstractItemView, QScrollArea, QFrame,
 )
 
 from vk_uploader import VkUploader
-
 from queue_manager import QueueManager, TaskStatus
 from settings import Settings
 from gpu_detector import detect_available_encoders
 from ffmpeg_handler import get_ffmpeg_path
 
 
+# ----------------------------------------------------------------------
+# Constants & helpers
+# ----------------------------------------------------------------------
+
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts")
+VIDEO_FILTER = "Видео (" + " ".join(f"*{e}" for e in VIDEO_EXTS) + ")"
+IMAGE_FILTER = "Картинки (*.png *.jpg *.jpeg *.webp)"
+LOGO_VIDEO_FILTER = "Видео (*.mp4 *.mov *.mkv *.webm)"
+AUDIO_FILTER = "Аудио (*.mp3 *.wav *.aac *.ogg *.m4a *.flac)"
+
+POSITIONS = [
+    ("top_left", "Вверху слева"),
+    ("top_right", "Вверху справа"),
+    ("bottom_left", "Внизу слева"),
+    ("bottom_right", "Внизу справа"),
+    ("center", "По центру"),
+]
+POSITION_NAMES = dict(POSITIONS)
+
+LOGO_DISPLAY = [
+    ("full", "Всё видео"),
+    ("segment_only", "Только основная часть (без интро/аутро)"),
+    ("first_n", "Первые N секунд"),
+    ("last_n", "Последние N секунд"),
+    ("custom", "Свой интервал"),
+]
+LOGO_DISPLAY_NAMES = dict(LOGO_DISPLAY)
+
+DURATION_PRESETS = [5, 10, 16, 20, 30]
+
+CPU_CODECS = ("libx264", "libx265")
+
+STATUS_COLORS = {
+    TaskStatus.DONE: "#6cc070",
+    TaskStatus.ERROR: "#e06c75",
+    TaskStatus.CANCELLED: "#909090",
+    TaskStatus.PROCESSING: "#4fa3e0",
+    TaskStatus.PROBING: "#4fa3e0",
+}
+
+MUTED = "color: #8a8a8a;"
+HINT = "color: #8a8a8a; font-size: 11px;"
+
+
+def natural_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """plural(3, "часть", "части", "частей") -> "3 части" """
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        word = one
+    elif 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        word = few
+    else:
+        word = many
+    return f"{n} {word}"
+
+
+def hint_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet(HINT)
+    return lbl
+
+
+def combo_select_data(combo: QComboBox, value, fallback_index: int = 0) -> None:
+    idx = combo.findData(value)
+    combo.setCurrentIndex(idx if idx >= 0 else fallback_index)
+
+
+def parse_vk_group_id(text: str) -> int | None:
+    """Accept '123', '-123', 'club123', 'public123' or a full vk.com/club123 URL."""
+    m = re.search(r"(\d+)\s*/?\s*$", text.strip())
+    return int(m.group(1)) if m else None
+
+
+# ----------------------------------------------------------------------
+# Reusable widgets
+# ----------------------------------------------------------------------
+
+class ElidedLabel(QLabel):
+    """Label that shortens long paths in the middle: C:\\…\\video.mp4"""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setMinimumWidth(60)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.set_full_text(text)
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text
+        self._refresh()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh()
+
+    def _refresh(self):
+        fm = self.fontMetrics()
+        self.setText(fm.elidedText(self._full, Qt.TextElideMode.ElideMiddle, max(20, self.width())))
+
+
+class PathField(QWidget):
+    """Path label + «Обзор…» + «✕» (clear). Shows a warning if the file is missing."""
+
+    pathChanged = Signal(str)
+
+    def __init__(self, placeholder="Не выбрано", mode="file", file_filter="",
+                 dialog_title="Выберите файл", parent=None):
+        super().__init__(parent)
+        self._path = ""
+        self._placeholder = placeholder
+        self._mode = mode
+        self._filter = file_filter
+        self._title = dialog_title
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.label = ElidedLabel()
+        self.btn_browse = QPushButton("Обзор…")
+        self.btn_browse.clicked.connect(self._browse)
+        self.btn_clear = QPushButton("✕")
+        self.btn_clear.setFixedWidth(32)
+        self.btn_clear.setToolTip("Сбросить")
+        self.btn_clear.clicked.connect(lambda: self.set_path("", emit=True))
+        lay.addWidget(self.label, stretch=1)
+        lay.addWidget(self.btn_browse)
+        lay.addWidget(self.btn_clear)
+        self._refresh()
+
+    def path(self) -> str:
+        return self._path
+
+    def exists(self) -> bool:
+        if not self._path:
+            return False
+        p = Path(self._path)
+        return p.is_dir() if self._mode == "dir" else p.is_file()
+
+    def set_path(self, path: str, emit: bool = False) -> None:
+        self._path = path or ""
+        self._refresh()
+        if emit:
+            self.pathChanged.emit(self._path)
+
+    def set_filter(self, file_filter: str) -> None:
+        self._filter = file_filter
+
+    def _browse(self):
+        start = ""
+        if self._path:
+            p = Path(self._path)
+            start = str(p if p.is_dir() else p.parent)
+        if self._mode == "dir":
+            path = QFileDialog.getExistingDirectory(self, self._title, start)
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, self._title, start, self._filter)
+        if path:
+            self.set_path(path, emit=True)
+
+    def _refresh(self):
+        self.btn_clear.setEnabled(bool(self._path))
+        if not self._path:
+            self.label.set_full_text(self._placeholder)
+            self.label.setStyleSheet(MUTED + " font-style: italic;")
+            self.label.setToolTip("")
+        elif not self.exists():
+            self.label.set_full_text("⚠ " + self._path)
+            self.label.setStyleSheet("color: #e06c75;")
+            self.label.setToolTip(f"Не найдено: {self._path}")
+        else:
+            self.label.set_full_text(self._path)
+            self.label.setStyleSheet("")
+            self.label.setToolTip(self._path)
+
+
+class QueueTable(QTableWidget):
+    """Table that shows a hint when empty."""
+
+    EMPTY_TEXT = ("Перетащите сюда видео или папку с видео\n"
+                  "или нажмите «Добавить файлы…»")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.rowCount() == 0:
+            p = QPainter(self.viewport())
+            p.setPen(QColor("#7a7a7a"))
+            p.drawText(self.viewport().rect().adjusted(10, 10, -10, -10),
+                       Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                       self.EMPTY_TEXT)
+            p.end()
+
+
+# ----------------------------------------------------------------------
+# Dialogs
+# ----------------------------------------------------------------------
 
 class LogoEditDialog(QDialog):
     def __init__(self, parent=None, logo_data=None):
         super().__init__(parent)
         self.setWindowTitle("Настройка логотипа")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(460)
         self.logo_data = logo_data or {
-            "path": "",
-            "type": "image",
-            "position": "top_right",
-            "size": 15,
-            "opacity": 80,
-            "angle": 0,
-            "color": "Green (0x00FF00)",
-            "display": "full",
-            "time_start": 0,
-            "time_end": 10
+            "path": "", "type": "image", "position": "top_right",
+            "size": 15, "opacity": 80, "angle": 0,
+            "color": "Green (0x00FF00)", "display": "full",
+            "time_start": 0, "time_end": 10,
         }
         self._init_ui()
         self._load_data()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
+        form = QFormLayout()
 
-        h_type = QHBoxLayout()
-        h_type.addWidget(QLabel("Тип:"))
         self.cb_type = QComboBox()
-        self.cb_type.addItems(["image", "video_chromakey"])
+        self.cb_type.addItem("Картинка (PNG/JPG)", "image")
+        self.cb_type.addItem("Видео с однотонным фоном (хромакей)", "video_chromakey")
+        self.cb_type.setToolTip(
+            "Картинка — обычный логотип, лучше PNG с прозрачным фоном.\n"
+            "Хромакей — анимированный логотип-видео: фон указанного цвета станет прозрачным."
+        )
         self.cb_type.currentIndexChanged.connect(self._on_type_changed)
-        h_type.addWidget(self.cb_type)
-        layout.addLayout(h_type)
+        form.addRow("Тип:", self.cb_type)
 
-        self.w_color = QWidget()
-        h_color = QHBoxLayout(self.w_color)
-        h_color.setContentsMargins(0,0,0,0)
-        h_color.addWidget(QLabel("Цвет фона (Chromakey):"))
+        self.path_field = PathField("Файл не выбран", dialog_title="Выберите логотип")
+        form.addRow("Файл:", self.path_field)
+
         self.cb_color = QComboBox()
-        self.cb_color.addItems(["Green (0x00FF00)", "Blue (0x0000FF)", "Black (0x000000)"])
-        h_color.addWidget(self.cb_color)
-        layout.addWidget(self.w_color)
+        self.cb_color.addItem("Зелёный", "Green (0x00FF00)")
+        self.cb_color.addItem("Синий", "Blue (0x0000FF)")
+        self.cb_color.addItem("Чёрный", "Black (0x000000)")
+        self.cb_color.setToolTip("Этот цвет фона будет вырезан из видео-логотипа")
+        self.lbl_color = QLabel("Цвет фона:")
+        form.addRow(self.lbl_color, self.cb_color)
 
-        h_path = QHBoxLayout()
-        self.lbl_path = QLabel("Путь не выбран")
-        btn_browse = QPushButton("Обзор...")
-        btn_browse.clicked.connect(self._browse)
-        h_path.addWidget(self.lbl_path, stretch=1)
-        h_path.addWidget(btn_browse)
-        layout.addLayout(h_path)
-
-        h_pos = QHBoxLayout()
-        h_pos.addWidget(QLabel("Позиция:"))
         self.cb_pos = QComboBox()
-        self.cb_pos.addItems(["top_left", "top_right", "bottom_left", "bottom_right", "center"])
-        h_pos.addWidget(self.cb_pos)
-        layout.addLayout(h_pos)
+        for key, name in POSITIONS:
+            self.cb_pos.addItem(name, key)
+        form.addRow("Где разместить:", self.cb_pos)
 
-        h_size = QHBoxLayout()
-        h_size.addWidget(QLabel("Размер (%):"))
         self.spin_size = QSpinBox()
         self.spin_size.setRange(5, 50)
-        h_size.addWidget(self.spin_size)
-        layout.addLayout(h_size)
+        self.spin_size.setSuffix(" % ширины кадра")
+        form.addRow("Размер:", self.spin_size)
 
-        h_op = QHBoxLayout()
-        h_op.addWidget(QLabel("Прозрачность (%):"))
         self.spin_op = QSpinBox()
         self.spin_op.setRange(0, 100)
-        h_op.addWidget(self.spin_op)
-        layout.addLayout(h_op)
+        self.spin_op.setSuffix(" %")
+        self.spin_op.setToolTip("100% — логотип полностью виден, 0% — невидим")
+        form.addRow("Видимость:", self.spin_op)
 
-        h_angle = QHBoxLayout()
-        h_angle.addWidget(QLabel("Угол наклона (град):"))
         self.spin_angle = QSpinBox()
         self.spin_angle.setRange(-360, 360)
-        h_angle.addWidget(self.spin_angle)
-        layout.addLayout(h_angle)
+        self.spin_angle.setSuffix("°")
+        form.addRow("Поворот:", self.spin_angle)
 
-        h_time = QHBoxLayout()
-        h_time.addWidget(QLabel("Показ:"))
         self.cb_time = QComboBox()
-        self.cb_time.addItem("На всё видео", "full")
-        self.cb_time.addItem("Только на сегмент (без интро/аутро)", "segment_only")
-        self.cb_time.addItem("Первые N секунд", "first_n")
-        self.cb_time.addItem("Последние N секунд", "last_n")
-        self.cb_time.addItem("Своё время", "custom")
+        for key, name in LOGO_DISPLAY:
+            self.cb_time.addItem(name, key)
         self.cb_time.currentIndexChanged.connect(self._on_time_changed)
-        h_time.addWidget(self.cb_time)
-        layout.addLayout(h_time)
+        form.addRow("Когда показывать:", self.cb_time)
 
+        # first_n / last_n → one value
+        self.spin_n = QSpinBox()
+        self.spin_n.setRange(1, 36000)
+        self.spin_n.setSuffix(" сек")
+        self.lbl_n = QLabel("N:")
+        form.addRow(self.lbl_n, self.spin_n)
+
+        # custom → from/to
         self.w_times = QWidget()
         lt = QHBoxLayout(self.w_times)
-        lt.setContentsMargins(0,0,0,0)
-        lt.addWidget(QLabel("От:"))
+        lt.setContentsMargins(0, 0, 0, 0)
         self.spin_tstart = QSpinBox()
-        self.spin_tstart.setRange(0, 3600)
-        lt.addWidget(self.spin_tstart)
-        lt.addWidget(QLabel("До:"))
+        self.spin_tstart.setRange(0, 36000)
+        self.spin_tstart.setSuffix(" сек")
         self.spin_tend = QSpinBox()
-        self.spin_tend.setRange(0, 3600)
+        self.spin_tend.setRange(0, 36000)
+        self.spin_tend.setSuffix(" сек")
+        lt.addWidget(QLabel("с"))
+        lt.addWidget(self.spin_tstart)
+        lt.addWidget(QLabel("по"))
         lt.addWidget(self.spin_tend)
-        self.w_times.setVisible(False)
-        layout.addWidget(self.w_times)
+        lt.addStretch()
+        self.lbl_times = QLabel("Интервал:")
+        form.addRow(self.lbl_times, self.w_times)
+
+        layout.addLayout(form)
+        layout.addWidget(hint_label("Время отсчитывается от начала каждой готовой части (включая интро)."))
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def _browse(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Выбрать логотип", "", "Media (*.png *.jpg *.jpeg *.mp4 *.mov)")
-        if f:
-            self.lbl_path.setText(f)
-
     def _on_time_changed(self):
         display = self.cb_time.currentData()
-        # поля времени нужны только для first_n / last_n / custom
-        self.w_times.setVisible(display in ("first_n", "last_n", "custom"))
-        # для first_n — только поле "До", для last_n — только "От"
-        if display == "first_n":
-            self.spin_tstart.setEnabled(False)
-            self.spin_tend.setEnabled(True)
-        elif display == "last_n":
-            self.spin_tstart.setEnabled(True)
-            self.spin_tend.setEnabled(False)
-        else:
-            self.spin_tstart.setEnabled(True)
-            self.spin_tend.setEnabled(True)
+        single = display in ("first_n", "last_n")
+        self.lbl_n.setVisible(single)
+        self.spin_n.setVisible(single)
+        self.lbl_n.setText("Первые:" if display == "first_n" else "Последние:")
+        custom = display == "custom"
+        self.lbl_times.setVisible(custom)
+        self.w_times.setVisible(custom)
+        self.adjustSize()
 
     def _on_type_changed(self):
-        self.w_color.setVisible(self.cb_type.currentText() == "video_chromakey")
+        is_video = self.cb_type.currentData() == "video_chromakey"
+        self.lbl_color.setVisible(is_video)
+        self.cb_color.setVisible(is_video)
+        self.path_field.set_filter(LOGO_VIDEO_FILTER if is_video else IMAGE_FILTER)
 
     def _load_data(self):
-        self.cb_type.setCurrentText(self.logo_data.get("type", "image"))
-        self.lbl_path.setText(self.logo_data.get("path", "Путь не выбран") or "Путь не выбран")
-        self.cb_pos.setCurrentText(self.logo_data.get("position", "top_right"))
-        self.spin_size.setValue(self.logo_data.get("size", 15))
-        self.spin_op.setValue(self.logo_data.get("opacity", 80))
-        self.spin_angle.setValue(self.logo_data.get("angle", 0))
-        self.cb_color.setCurrentText(self.logo_data.get("color", "Green (0x00FF00)"))
-        # находим индекс по data-значению
-        display_val = self.logo_data.get("display", "full")
-        idx = self.cb_time.findData(display_val)
-        self.cb_time.setCurrentIndex(idx if idx >= 0 else 0)
-        self.spin_tstart.setValue(self.logo_data.get("time_start", 0))
-        self.spin_tend.setValue(self.logo_data.get("time_end", 10))
+        d = self.logo_data
+        combo_select_data(self.cb_type, d.get("type", "image"))
+        self.path_field.set_path(d.get("path", ""))
+        combo_select_data(self.cb_pos, d.get("position", "top_right"), 1)
+        self.spin_size.setValue(d.get("size", 15))
+        self.spin_op.setValue(d.get("opacity", 80))
+        self.spin_angle.setValue(d.get("angle", 0))
+        combo_select_data(self.cb_color, d.get("color", "Green (0x00FF00)"))
+        display = d.get("display", "full")
+        combo_select_data(self.cb_time, display)
+        self.spin_tstart.setValue(d.get("time_start", 0))
+        self.spin_tend.setValue(d.get("time_end", 10))
+        # first_n uses time_end, last_n uses time_start
+        if display == "first_n":
+            self.spin_n.setValue(max(1, d.get("time_end", 10)))
+        elif display == "last_n":
+            self.spin_n.setValue(max(1, d.get("time_start", 10)))
+        else:
+            self.spin_n.setValue(10)
         self._on_time_changed()
         self._on_type_changed()
 
+    def _on_accept(self):
+        if not self.path_field.path():
+            QMessageBox.warning(self, "Логотип", "Выберите файл логотипа.")
+            return
+        if self.cb_time.currentData() == "custom" and self.spin_tend.value() <= self.spin_tstart.value():
+            QMessageBox.warning(self, "Логотип", "Время «по» должно быть больше времени «с».")
+            return
+        self.accept()
+
     def get_data(self):
+        display = self.cb_time.currentData()
+        t_start, t_end = self.spin_tstart.value(), self.spin_tend.value()
+        if display == "first_n":
+            t_start, t_end = 0, self.spin_n.value()
+        elif display == "last_n":
+            t_start, t_end = self.spin_n.value(), 0
         return {
-            "path": self.lbl_path.text() if self.lbl_path.text() != "Путь не выбран" else "",
-            "type": self.cb_type.currentText(),
-            "position": self.cb_pos.currentText(),
+            "path": self.path_field.path(),
+            "type": self.cb_type.currentData(),
+            "position": self.cb_pos.currentData(),
             "size": self.spin_size.value(),
             "opacity": self.spin_op.value(),
             "angle": self.spin_angle.value(),
-            "color": self.cb_color.currentText(),
-            "display": self.cb_time.currentData(),   # data-значение, не текст с экрана
-            "time_start": self.spin_tstart.value(),
-            "time_end": self.spin_tend.value(),
+            "color": self.cb_color.currentData(),
+            "display": display,
+            "time_start": t_start,
+            "time_end": t_end,
         }
 
 
@@ -197,104 +412,90 @@ class SoundOverlayDialog(QDialog):
 
     def __init__(self, parent=None, data=None):
         super().__init__(parent)
-        self.setWindowTitle("Настройка звукового оверлея")
-        self.setMinimumWidth(380)
-        self._data = data or {
-            "path": "",
-            "start_sec": 0,
-            "volume": 0.8,
-            "loop": False,
-        }
+        self.setWindowTitle("Настройка звука")
+        self.setMinimumWidth(420)
+        self._data = data or {"path": "", "start_sec": 0, "volume": 0.8, "loop": False}
         self._init_ui()
         self._load_data()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
+        form = QFormLayout()
 
-        # Path
-        h_path = QHBoxLayout()
-        self.lbl_path = QLabel("Путь не выбран")
-        self.lbl_path.setWordWrap(True)
-        btn_browse = QPushButton("Обзор...")
-        btn_browse.clicked.connect(self._browse)
-        h_path.addWidget(self.lbl_path, stretch=1)
-        h_path.addWidget(btn_browse)
-        layout.addLayout(h_path)
+        self.path_field = PathField("Файл не выбран", file_filter=AUDIO_FILTER,
+                                    dialog_title="Выберите аудиофайл")
+        form.addRow("Файл:", self.path_field)
 
-        # Start sec
-        h_start = QHBoxLayout()
-        h_start.addWidget(QLabel("Старт (сек от начала сегмента):"))
         self.spin_start = QSpinBox()
         self.spin_start.setRange(0, 7200)
-        self.spin_start.setSuffix(" с")
-        h_start.addWidget(self.spin_start)
-        layout.addLayout(h_start)
+        self.spin_start.setSuffix(" сек")
+        self.spin_start.setToolTip("Через сколько секунд от начала части начнёт играть звук")
+        form.addRow("Начать через:", self.spin_start)
 
-        # Volume
-        h_vol = QHBoxLayout()
-        h_vol.addWidget(QLabel("Громкость (%):"))
         self.spin_vol = QSpinBox()
         self.spin_vol.setRange(0, 200)
         self.spin_vol.setSuffix(" %")
-        h_vol.addWidget(self.spin_vol)
-        layout.addLayout(h_vol)
+        self.spin_vol.setToolTip("100% — исходная громкость файла. Звук стрима не приглушается.")
+        form.addRow("Громкость:", self.spin_vol)
 
-        # Loop
-        self.chk_loop = QCheckBox("Зациклить до конца видео")
-        layout.addWidget(self.chk_loop)
+        self.chk_loop = QCheckBox("Повторять по кругу до конца части")
+        form.addRow("", self.chk_loop)
 
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(self.accept)
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def _browse(self):
-        f, _ = QFileDialog.getOpenFileName(
-            self, "Выбрать аудиофайл", "",
-            "Аудио (*.mp3 *.wav *.aac *.ogg *.m4a *.flac)"
-        )
-        if f:
-            self.lbl_path.setText(f)
-
     def _load_data(self):
-        p = self._data.get("path", "")
-        self.lbl_path.setText(p or "Путь не выбран")
+        self.path_field.set_path(self._data.get("path", ""))
         self.spin_start.setValue(int(self._data.get("start_sec", 0)))
-        self.spin_vol.setValue(int(self._data.get("volume", 0.8) * 100))
+        self.spin_vol.setValue(int(round(self._data.get("volume", 0.8) * 100)))
         self.chk_loop.setChecked(bool(self._data.get("loop", False)))
 
+    def _on_accept(self):
+        if not self.path_field.path():
+            QMessageBox.warning(self, "Звук", "Выберите аудиофайл.")
+            return
+        self.accept()
+
     def get_data(self) -> dict:
-        path = self.lbl_path.text()
         return {
-            "path": "" if path == "Путь не выбран" else path,
+            "path": self.path_field.path(),
             "start_sec": self.spin_start.value(),
             "volume": round(self.spin_vol.value() / 100.0, 2),
             "loop": self.chk_loop.isChecked(),
         }
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings):
+# ----------------------------------------------------------------------
+# Main window
+# ----------------------------------------------------------------------
 
+class MainWindow(QMainWindow):
+    encoders_detected = Signal(dict)
+
+    COL_NAME, COL_DUR, COL_STATUS, COL_PROGRESS = range(4)
+
+    def __init__(self, settings: Settings):
         super().__init__()
         self.settings = settings
+        self._ui_loading = False          # suppress saves while filling widgets
+        self._stop_requested = False
+        self._running = False
+        self._queue_start_time = 0.0
+        self._available_encoders: dict = {}
+        self._vk_uploader: VkUploader | None = None
+        self._log_path: Path | None = None
+        self._logos_data: list = []
+        self._sounds_data: list = []
 
         self.setWindowTitle("Stream Auto Cutter")
-        self.resize(1000, 700)
-        self.setMinimumSize(800, 600)
+        self.resize(1150, 760)
+        self.setMinimumSize(900, 620)
         self.setAcceptDrops(True)
-
-        # Set App Window Icon
-        for icon_name in ("icon.png", "icon.ico"):
-            meipass = getattr(sys, "_MEIPASS", None)
-            icon_p = Path(meipass) / icon_name if meipass else Path(__file__).parent / icon_name
-            if icon_p.is_file():
-                self.setWindowIcon(QIcon(str(icon_p)))
-                break
-
-        # Apply dark theme
+        self._set_icon()
         self.apply_theme()
 
         # Core manager
@@ -303,274 +504,749 @@ class MainWindow(QMainWindow):
         self.queue_manager.task_progress.connect(self._on_task_progress)
         self.queue_manager.task_completed.connect(self._on_task_completed)
         self.queue_manager.queue_completed.connect(self._on_queue_completed)
-        self.queue_manager.log_message.connect(self._on_log_message)
+        self.queue_manager.log_message.connect(self._log_message)
 
-        # Central widget
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        self._build_ui()
 
-        # Splitter for files list and settings
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter, stretch=1)
-
-        # Left panel: Files
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        
-        files_group = QGroupBox("Очередь файлов")
-        files_layout = QVBoxLayout(files_group)
-        
-        # Files buttons
-        files_btn_layout = QHBoxLayout()
-        self.btn_add_file = QPushButton("Добавить файлы...")
-        self.btn_add_file.clicked.connect(self.action_add_files)
-        self.btn_add_folder = QPushButton("Добавить папку...")
-        self.btn_add_folder.clicked.connect(self.action_add_folder)
-        self.btn_remove = QPushButton("Удалить выбранные")
-        self.btn_remove.clicked.connect(self.action_remove_files)
-        self.btn_clear = QPushButton("Очистить")
-        self.btn_clear.clicked.connect(self.action_clear_files)
-        
-        files_btn_layout.addWidget(self.btn_add_file)
-        files_btn_layout.addWidget(self.btn_add_folder)
-        files_btn_layout.addWidget(self.btn_remove)
-        files_btn_layout.addWidget(self.btn_clear)
-        files_layout.addLayout(files_btn_layout)
-
-        # Table
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Имя", "Длительность", "Статус", "Прогресс"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(3, 100)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        # Enable drag and drop later
-        self.table.setAcceptDrops(True)
-        files_layout.addWidget(self.table)
-        
-        left_layout.addWidget(files_group)
-        splitter.addWidget(left_panel)
-
-        # Right panel: Settings
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Presets bar (above tabs)
-        self._preset_loading = False  # guard to avoid recursive saves
-        right_layout.addLayout(self._build_presets_bar())
-
-        self.tabs = QTabWidget()
-
-        self.tab_cut = self._create_cut_tab()
-        self.tab_io = self._create_io_tab()
-        self.tab_logo = self._create_logo_tab()
-        self.tab_video = self._create_video_tab()
-        self.tab_sound = self._create_sound_tab()
-        self.tab_vk = self._create_vk_tab()
-
-        self.tabs.addTab(self.tab_cut, "Нарезка")
-        self.tabs.addTab(self.tab_io, "Интро/Аутро")
-        self.tabs.addTab(self.tab_logo, "Логотип")
-        self.tabs.addTab(self.tab_video, "Видео")
-        self.tabs.addTab(self.tab_sound, "🔊 Аудио")
-        self.tabs.addTab(self.tab_vk, "ВКонтакте")
-
-        # VK uploader worker
-        self._vk_uploader: VkUploader | None = None
-
-        right_layout.addWidget(self.tabs)
-        splitter.addWidget(right_panel)
-
-        splitter.setSizes([400, 400])
-
-        # Bottom panel: Log and Progress
-        bottom_layout = QVBoxLayout()
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(100)
-        bottom_layout.addWidget(self.log_text)
-        
-        controls_layout = QHBoxLayout()
-        
-        self.btn_start = QPushButton("▶ Старт")
-        self.btn_start.setMinimumHeight(40)
-        self.btn_start.clicked.connect(self.action_start)
-        
-        self.btn_pause = QPushButton("⏸ Пауза")
-        self.btn_pause.setMinimumHeight(40)
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.clicked.connect(self.action_pause)
-        
-        self.btn_stop = QPushButton("⏹ Стоп")
-        self.btn_stop.setMinimumHeight(40)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.action_stop)
-        
-        self.progress_overall = QProgressBar()
-        self.progress_overall.setTextVisible(True)
-        self.progress_overall.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.progress_overall.setFormat("%p%")
-        
-        controls_layout.addWidget(self.btn_start)
-        controls_layout.addWidget(self.btn_pause)
-        controls_layout.addWidget(self.btn_stop)
-        controls_layout.addWidget(self.progress_overall, stretch=1)
-        
-        bottom_layout.addLayout(controls_layout)
-
-        # ETA / speed / chunks info line
-        self.lbl_eta = QLabel("")
-        self.lbl_eta.setStyleSheet("color: #a0a0a0; font-size: 12px; padding: 2px 4px;")
-        bottom_layout.addWidget(self.lbl_eta)
-
-        main_layout.addLayout(bottom_layout)
-
-        # Queue timing
-        self._queue_start_time: float = 0.0
-        self._available_encoders: dict = {}
-
-        # Elapsed-time timer (ticks every second while processing)
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
         self._elapsed_timer.timeout.connect(self._update_elapsed)
 
-        # Load settings to UI
-        self._load_settings_to_ui()
-        
-        # Connect settings changes to save
+        self._apply_values_to_ui(self.settings.get_all())
         self._connect_ui_to_settings()
+        self._update_preset_dirty()
 
-        # Auto-detect GPU encoders in background
+        self.encoders_detected.connect(self._on_encoders_detected)
         self._detect_gpu_encoders()
+
+    def _set_icon(self):
+        meipass = getattr(sys, "_MEIPASS", None)
+        base = Path(meipass) if meipass else Path(__file__).parent
+        for icon_name in ("icon.png", "icon.ico"):
+            icon_p = base / icon_name
+            if icon_p.is_file():
+                self.setWindowIcon(QIcon(str(icon_p)))
+                break
 
     # ------------------------------------------------------------------
     # UI Creation
     # ------------------------------------------------------------------
 
-    def _create_cut_tab(self) -> QWidget:
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
+
+        v_split = QSplitter(Qt.Orientation.Vertical)
+        main_layout.addWidget(v_split, stretch=1)
+
+        h_split = QSplitter(Qt.Orientation.Horizontal)
+        h_split.addWidget(self._build_queue_panel())
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addLayout(self._build_presets_bar())
+
+        self.tabs = QTabWidget()
+        self.tab_main = self._create_main_tab()
+        self.tab_video = self._create_video_tab()
+        self.tab_io = self._create_io_tab()
+        self.tab_logo = self._create_logo_tab()
+        self.tab_sound = self._create_sound_tab()
+        self.tab_vk = self._create_vk_tab()
+        for page, title in ((self.tab_main, "Нарезка"), (self.tab_video, "Видео"),
+                            (self.tab_io, "Интро / Аутро"), (self.tab_logo, "Логотип"),
+                            (self.tab_sound, "Звук"), (self.tab_vk, "ВКонтакте")):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(page)
+            self.tabs.addTab(scroll, title)
+        self._processing_tabs = [self.tab_main, self.tab_video, self.tab_io,
+                                 self.tab_logo, self.tab_sound]
+        rl.addWidget(self.tabs, stretch=1)
+        h_split.addWidget(right)
+        h_split.setSizes([520, 560])
+        v_split.addWidget(h_split)
+
+        # Log
+        log_group = QGroupBox("Журнал")
+        ll = QVBoxLayout(log_group)
+        ll.setContentsMargins(6, 6, 6, 6)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(50)
+        ll.addWidget(self.log_text)
+        v_split.addWidget(log_group)
+        v_split.setStretchFactor(0, 1)
+        v_split.setStretchFactor(1, 0)
+        self._v_split = v_split
+        self._initial_layout_done = False
+
+        # Controls
+        controls = QHBoxLayout()
+        self.btn_start = QPushButton("▶ Старт")
+        self.btn_start.setObjectName("primary")
+        self.btn_start.setToolTip("Начать нарезку всех файлов из очереди")
+        self.btn_start.clicked.connect(self.action_start)
+        self.btn_pause = QPushButton("⏸ Пауза")
+        self.btn_pause.setToolTip("Текущая часть доделается, следующая не начнётся, пока не нажмёте «Продолжить»")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self.action_pause)
+        self.btn_stop = QPushButton("⏹ Стоп")
+        self.btn_stop.setToolTip("Прервать обработку. Уже готовые части останутся.")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.action_stop)
+        for b in (self.btn_start, self.btn_pause, self.btn_stop):
+            b.setMinimumHeight(40)
+
+        self.progress_overall = QProgressBar()
+        self.progress_overall.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_overall.setFormat("Общий прогресс: %p%")
+        self.progress_overall.setMinimumHeight(28)
+        self.progress_overall.setValue(0)
+
+        self.btn_open_output = QPushButton("📂 Папка с результатом")
+        self.btn_open_output.setMinimumHeight(40)
+        self.btn_open_output.setToolTip("Открыть папку, куда сохраняются готовые части")
+        self.btn_open_output.clicked.connect(self._open_output_folder)
+
+        controls.addWidget(self.btn_start)
+        controls.addWidget(self.btn_pause)
+        controls.addWidget(self.btn_stop)
+        controls.addWidget(self.progress_overall, stretch=1)
+        controls.addWidget(self.btn_open_output)
+        main_layout.addLayout(controls)
+
+        self.lbl_eta = QLabel("")
+        self.lbl_eta.setStyleSheet("color: #a0a0a0; font-size: 12px; padding: 2px 4px;")
+        main_layout.addWidget(self.lbl_eta)
+
+    def _build_queue_panel(self) -> QWidget:
+        files_group = QGroupBox("Очередь файлов")
+        fl = QVBoxLayout(files_group)
+
+        btns = QHBoxLayout()
+        self.btn_add_file = QPushButton("➕ Добавить файлы…")
+        self.btn_add_file.clicked.connect(self.action_add_files)
+        self.btn_add_folder = QPushButton("📁 Добавить папку…")
+        self.btn_add_folder.clicked.connect(self.action_add_folder)
+        self.btn_remove = QPushButton("Убрать выбранные")
+        self.btn_remove.setToolTip("Убрать из очереди (сами файлы не удаляются). Клавиша Delete.")
+        self.btn_remove.clicked.connect(self.action_remove_files)
+        self.btn_remove.setEnabled(False)
+        self.btn_clear = QPushButton("Очистить")
+        self.btn_clear.setToolTip("Убрать все файлы из очереди (сами файлы не удаляются)")
+        self.btn_clear.clicked.connect(self.action_clear_files)
+        for b in (self.btn_add_file, self.btn_add_folder, self.btn_remove, self.btn_clear):
+            btns.addWidget(b)
+        fl.addLayout(btns)
+
+        self.table = QueueTable(0, 4)
+        self.table.setHorizontalHeaderLabels(["Файл", "Длительность", "Статус", "Прогресс"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(self.COL_DUR, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_PROGRESS, 150)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._update_queue_buttons)
+        fl.addWidget(self.table)
+
+        QShortcut(QKeySequence.StandardKey.Delete, self.table, activated=self.action_remove_files)
+
+        self.lbl_queue_summary = QLabel("")
+        self.lbl_queue_summary.setStyleSheet(HINT)
+        fl.addWidget(self.lbl_queue_summary)
+        return files_group
+
+    def _create_main_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        group = QGroupBox("Настройки нарезки")
-        glayout = QVBoxLayout(group)
-        
-        hlayout = QHBoxLayout()
-        hlayout.addWidget(QLabel("Длина части:"))
-        
+
+        group = QGroupBox("Длина частей")
+        gl = QVBoxLayout(group)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("Резать на части по:"))
         self.cb_duration = QComboBox()
-        self.cb_duration.addItems(["5 минут", "10 минут", "16 минут", "20 минут", "30 минут", "Своё значение"])
+        for m in DURATION_PRESETS:
+            self.cb_duration.addItem(f"{m} минут", m)
+        self.cb_duration.addItem("Своё значение…", None)
         self.cb_duration.currentIndexChanged.connect(self._on_duration_type_changed)
-        hlayout.addWidget(self.cb_duration)
-        
+        h.addWidget(self.cb_duration)
         self.spin_duration = QSpinBox()
         self.spin_duration.setRange(1, 600)
         self.spin_duration.setSuffix(" мин")
-        self.spin_duration.setEnabled(False)
-        hlayout.addWidget(self.spin_duration)
-        
-        hlayout.addStretch()
-        glayout.addLayout(hlayout)
-        
+        self.spin_duration.setVisible(False)
+        h.addWidget(self.spin_duration)
+        h.addStretch()
+        gl.addLayout(h)
+        gl.addWidget(hint_label(
+            "Каждое видео из очереди будет разрезано на части такой длины. "
+            "Например, стрим на 2 часа при 16 минутах даст 8 частей."))
         layout.addWidget(group)
+
+        out_group = QGroupBox("Куда сохранять")
+        ol = QVBoxLayout(out_group)
+        self.rb_out_near = QRadioButton("Рядом с исходным видео, в подпапку «output»")
+        self.rb_out_custom = QRadioButton("В свою папку:")
+        self.out_path = PathField("Папка не выбрана", mode="dir", dialog_title="Куда сохранять готовые части")
+        ol.addWidget(self.rb_out_near)
+        h_out = QHBoxLayout()
+        h_out.addWidget(self.rb_out_custom)
+        h_out.addWidget(self.out_path, stretch=1)
+        ol.addLayout(h_out)
+        ol.addWidget(hint_label("Имена готовых файлов: <имя видео>_part01.mp4, _part02.mp4 …"))
+        self.rb_out_near.toggled.connect(self._on_output_mode_changed)
+        self.out_path.pathChanged.connect(self._on_output_path_picked)
+        layout.addWidget(out_group)
+
         layout.addStretch()
         return widget
 
     def _create_io_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Intro
-        grp_intro = QGroupBox("Интро")
-        l_intro = QVBoxLayout(grp_intro)
-        
-        self.chk_intro = QCheckBox("Включить интро")
-        l_intro.addWidget(self.chk_intro)
-        
-        h_intro = QHBoxLayout()
-        self.lbl_intro_path = QLabel("Путь не выбран")
-        btn_intro_browse = QPushButton("Обзор...")
-        btn_intro_browse.clicked.connect(lambda: self._browse_file(self.lbl_intro_path, "intro_path"))
-        h_intro.addWidget(self.lbl_intro_path, stretch=1)
-        h_intro.addWidget(btn_intro_browse)
-        l_intro.addLayout(h_intro)
+        layout.addWidget(hint_label(
+            "Интро и аутро добавляются к КАЖДОЙ части: в начало и в конец соответственно."))
+
+        grp_intro = QGroupBox("Интро (в начале)")
+        li = QVBoxLayout(grp_intro)
+        self.chk_intro = QCheckBox("Добавлять интро")
+        self.intro_path = PathField("Видео не выбрано", file_filter=VIDEO_FILTER, dialog_title="Выберите интро")
+        li.addWidget(self.chk_intro)
+        li.addWidget(self.intro_path)
         layout.addWidget(grp_intro)
-        
-        # Outro
-        grp_outro = QGroupBox("Аутро")
-        l_outro = QVBoxLayout(grp_outro)
-        
-        self.chk_outro = QCheckBox("Включить аутро")
-        l_outro.addWidget(self.chk_outro)
-        
-        h_outro = QHBoxLayout()
-        self.lbl_outro_path = QLabel("Путь не выбран")
-        btn_outro_browse = QPushButton("Обзор...")
-        btn_outro_browse.clicked.connect(lambda: self._browse_file(self.lbl_outro_path, "outro_path"))
-        h_outro.addWidget(self.lbl_outro_path, stretch=1)
-        h_outro.addWidget(btn_outro_browse)
-        l_outro.addLayout(h_outro)
+
+        grp_outro = QGroupBox("Аутро (в конце)")
+        lo = QVBoxLayout(grp_outro)
+        self.chk_outro = QCheckBox("Добавлять аутро")
+        self.outro_path = PathField("Видео не выбрано", file_filter=VIDEO_FILTER, dialog_title="Выберите аутро")
+        lo.addWidget(self.chk_outro)
+        lo.addWidget(self.outro_path)
         layout.addWidget(grp_outro)
-        
+
+        self.chk_intro.toggled.connect(self.intro_path.setEnabled)
+        self.chk_outro.toggled.connect(self.outro_path.setEnabled)
+        # selecting a file implies the user wants it on
+        self.intro_path.pathChanged.connect(lambda p: p and self.chk_intro.setChecked(True))
+        self.outro_path.pathChanged.connect(lambda p: p and self.chk_outro.setChecked(True))
+
         layout.addStretch()
         return widget
 
+    def _create_list_editor(self, add_text, on_add, on_edit, on_remove):
+        """List + Add/Edit/Remove buttons. Returns (container, list, edit_btn, remove_btn)."""
+        box = QWidget()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        lst = QListWidget()
+        lst.itemDoubleClicked.connect(lambda _: on_edit())
+        bl.addWidget(lst)
+        h = QHBoxLayout()
+        b_add = QPushButton(add_text)
+        b_add.clicked.connect(on_add)
+        b_edit = QPushButton("Изменить")
+        b_edit.clicked.connect(on_edit)
+        b_del = QPushButton("Удалить")
+        b_del.clicked.connect(on_remove)
+        for b in (b_add, b_edit, b_del):
+            h.addWidget(b)
+        bl.addLayout(h)
+
+        def _sel():
+            has = lst.currentRow() >= 0
+            b_edit.setEnabled(has)
+            b_del.setEnabled(has)
+        lst.currentRowChanged.connect(lambda _: _sel())
+        _sel()
+        return box, lst
 
     def _create_logo_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        self.chk_logo = QCheckBox("Включить наложение логотипов")
+        self.chk_logo = QCheckBox("Накладывать логотипы")
         layout.addWidget(self.chk_logo)
-        
-        self.list_logos = QListWidget()
-        layout.addWidget(self.list_logos)
-        
-        h_btns = QHBoxLayout()
-        btn_add = QPushButton("Добавить логотип")
-        btn_add.clicked.connect(self._action_add_logo)
-        h_btns.addWidget(btn_add)
-        
-        btn_edit = QPushButton("Изменить")
-        btn_edit.clicked.connect(self._action_edit_logo)
-        h_btns.addWidget(btn_edit)
-        
-        btn_remove = QPushButton("Удалить")
-        btn_remove.clicked.connect(self._action_remove_logo)
-        h_btns.addWidget(btn_remove)
-        
-        layout.addLayout(h_btns)
-        
-        # Save reference for internal list of dicts
-        self._logos_data = []
-        
+        self.logo_box, self.list_logos = self._create_list_editor(
+            "➕ Добавить логотип", self._action_add_logo, self._action_edit_logo, self._action_remove_logo)
+        layout.addWidget(self.logo_box)
+        layout.addWidget(hint_label("Можно добавить несколько логотипов. Двойной щелчок — изменить."))
+        self.chk_logo.toggled.connect(self.logo_box.setEnabled)
         return widget
+
+    def _create_sound_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.chk_sound = QCheckBox("Накладывать звук поверх звука стрима")
+        layout.addWidget(self.chk_sound)
+        self.sound_box, self.list_sounds = self._create_list_editor(
+            "➕ Добавить звук", self._action_add_sound, self._action_edit_sound, self._action_remove_sound)
+        layout.addWidget(self.sound_box)
+        layout.addWidget(hint_label(
+            "Например, фоновая музыка или звуковой сигнал. Оригинальный звук стрима остаётся."))
+        self.chk_sound.toggled.connect(self.sound_box.setEnabled)
+        return widget
+
+    def _create_video_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        grp = QGroupBox("Качество и скорость")
+        form = QFormLayout(grp)
+
+        h_res = QHBoxLayout()
+        self.cb_res = QComboBox()
+        self.cb_res.addItem("Как в исходнике", "source")
+        self.cb_res.addItem("720p (1280×720)", "1280x720")
+        self.cb_res.addItem("1080p (1920×1080)", "1920x1080")
+        self.cb_res.addItem("1440p (2560×1440)", "2560x1440")
+        self.cb_res.addItem("4K (3840×2160)", "3840x2160")
+        self.cb_res.addItem("Своё…", "custom")
+        self.cb_res.currentIndexChanged.connect(self._on_res_changed)
+        self.spin_res_w = QSpinBox()
+        self.spin_res_w.setRange(320, 7680)
+        self.spin_res_h = QSpinBox()
+        self.spin_res_h.setRange(240, 4320)
+        self.lbl_res_x = QLabel("×")
+        h_res.addWidget(self.cb_res)
+        h_res.addWidget(self.spin_res_w)
+        h_res.addWidget(self.lbl_res_x)
+        h_res.addWidget(self.spin_res_h)
+        h_res.addStretch()
+        form.addRow("Разрешение:", h_res)
+
+        self.cb_fps = QComboBox()
+        self.cb_fps.addItem("Как в исходнике", "source")
+        for f in ("24", "30", "60"):
+            self.cb_fps.addItem(f"{f} кадров/сек", f)
+        form.addRow("Частота кадров:", self.cb_fps)
+
+        self.cb_codec = QComboBox()
+        self.cb_codec.addItem("NVIDIA — H.264", "h264_nvenc")
+        self.cb_codec.addItem("NVIDIA — H.265 (HEVC)", "hevc_nvenc")
+        self.cb_codec.addItem("Intel — H.264", "h264_qsv")
+        self.cb_codec.addItem("Intel — H.265 (HEVC)", "hevc_qsv")
+        self.cb_codec.addItem("AMD — H.264", "h264_amf")
+        self.cb_codec.addItem("AMD — H.265 (HEVC)", "hevc_amf")
+        self.cb_codec.addItem("Mac — H.264", "h264_videotoolbox")
+        self.cb_codec.addItem("Mac — H.265 (HEVC)", "hevc_videotoolbox")
+        self.cb_codec.addItem("Процессор — H.264 (медленно, работает везде)", "libx264")
+        self.cb_codec.addItem("Процессор — H.265 (очень медленно)", "libx265")
+        self.cb_codec.setToolTip(
+            "Через что кодировать видео.\n"
+            "Видеокарта (NVIDIA/Intel/AMD/Mac) — в разы быстрее.\n"
+            "H.264 — совместим со всеми сайтами. H.265 — файлы меньше, но кодируется дольше."
+        )
+        self.lbl_codec_status = QLabel("Проверяю, какие кодеки работают на этом компьютере…")
+        self.lbl_codec_status.setStyleSheet(HINT)
+        self.lbl_codec_status.setWordWrap(True)
+        codec_box = QVBoxLayout()
+        codec_box.addWidget(self.cb_codec)
+        codec_box.addWidget(self.lbl_codec_status)
+        form.addRow("Кодек:", codec_box)
+
+        self.cb_workers = QComboBox()
+        self.cb_workers.addItem("1 — по одной части", 1)
+        self.cb_workers.addItem("2 — рекомендуется", 2)
+        self.cb_workers.addItem("3 — для мощных видеокарт", 3)
+        self.cb_workers.addItem("4 — максимум", 4)
+        self.cb_workers.setToolTip(
+            "Сколько частей кодировать одновременно.\n"
+            "Больше — быстрее, но сильнее нагрузка. Если появляются ошибки — уменьшите."
+        )
+        form.addRow("Одновременно:", self.cb_workers)
+        layout.addWidget(grp)
+
+        grp_shorts = QGroupBox("Вертикальное видео (Shorts / Reels / TikTok)")
+        sl = QVBoxLayout(grp_shorts)
+        self.chk_shorts = QCheckBox("Сделать вертикальным 9:16")
+        sl.addWidget(self.chk_shorts)
+        self.shorts_box = QWidget()
+        sf = QFormLayout(self.shorts_box)
+        sf.setContentsMargins(0, 0, 0, 0)
+        self.cb_shorts_res = QComboBox()
+        self.cb_shorts_res.addItem("1080×1920 (рекомендуется)", "1080x1920")
+        self.cb_shorts_res.addItem("720×1280", "720x1280")
+        sf.addRow("Размер:", self.cb_shorts_res)
+        self.cb_shorts_fit = QComboBox()
+        self.cb_shorts_fit.addItem("Видео целиком + размытый фон", "blur_sides")
+        self.cb_shorts_fit.addItem("Обрезать края, оставить центр", "crop_center")
+        self.cb_shorts_fit.addItem("Видео целиком + чёрные полосы", "black_bars")
+        self.cb_shorts_fit.setToolTip(
+            "Размытый фон — видно всё, сверху и снизу размытая копия кадра.\n"
+            "Обрезка — кадр на весь экран, но края слева и справа теряются.\n"
+            "Чёрные полосы — видно всё, сверху и снизу чёрное."
+        )
+        sf.addRow("Как вписать:", self.cb_shorts_fit)
+        sl.addWidget(self.shorts_box)
+        sl.addWidget(hint_label("При включении размер кадра берётся отсюда, а «Разрешение» выше не учитывается."))
+        self.chk_shorts.toggled.connect(self.shorts_box.setEnabled)
+        layout.addWidget(grp_shorts)
+
+        layout.addStretch()
+        return widget
+
+    def _create_vk_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(8)
+
+        auth_group = QGroupBox("Аккаунт")
+        af = QFormLayout(auth_group)
+
+        h_token = QHBoxLayout()
+        self.vk_token_edit = QLineEdit()
+        self.vk_token_edit.setPlaceholderText("vk1.a.xxxxxxxxxxxx…")
+        self.vk_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        btn_show = QPushButton("👁")
+        btn_show.setFixedWidth(36)
+        btn_show.setCheckable(True)
+        btn_show.setToolTip("Показать / скрыть токен")
+        btn_show.toggled.connect(lambda on: self.vk_token_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        btn_help = QPushButton("?")
+        btn_help.setFixedWidth(36)
+        btn_help.setToolTip("Что такое токен")
+        btn_help.clicked.connect(self._vk_show_help)
+        h_token.addWidget(self.vk_token_edit, stretch=1)
+        h_token.addWidget(btn_show)
+        h_token.addWidget(btn_help)
+        af.addRow("Токен:", h_token)
+
+        self.vk_group_edit = QLineEdit()
+        self.vk_group_edit.setPlaceholderText("пусто — на свою страницу; или 123456789 / club123456789")
+        self.vk_group_edit.setToolTip("Число из адреса группы: vk.com/club123456789 → 123456789")
+        af.addRow("Группа:", self.vk_group_edit)
+        layout.addWidget(auth_group)
+
+        src_group = QGroupBox("Что загружать")
+        sv = QVBoxLayout(src_group)
+        sf = QFormLayout()
+        self.vk_folder = PathField("Папка не выбрана", mode="dir", dialog_title="Папка с готовыми видео")
+        sf.addRow("Папка с видео:", self.vk_folder)
+        self.vk_titles = PathField("Файл не выбран", file_filter="Текстовые файлы (*.txt)",
+                                   dialog_title="Файл с названиями")
+        sf.addRow("Названия (.txt):", self.vk_titles)
+        sv.addLayout(sf)
+        self.vk_summary = QLabel("")
+        self.vk_summary.setWordWrap(True)
+        self.vk_summary.setVisible(False)
+        sv.addWidget(self.vk_summary)
+        sv.addWidget(hint_label(
+            "В файле с названиями — одно название на строку, по порядку видео. "
+            "Загруженные видео переносятся в подпапку «uploaded», а их названия удаляются из файла."))
+        self.vk_folder.pathChanged.connect(self._vk_update_summary)
+        self.vk_titles.pathChanged.connect(self._vk_update_summary)
+        layout.addWidget(src_group)
+
+        params_group = QGroupBox("Параметры")
+        pl = QHBoxLayout(params_group)
+        pl.addWidget(QLabel("Пауза между видео:"))
+        self.vk_delay_spin = QSpinBox()
+        self.vk_delay_spin.setRange(1, 300)
+        self.vk_delay_spin.setSuffix(" сек")
+        self.vk_delay_spin.setToolTip("Чтобы ВК не посчитал загрузку спамом")
+        pl.addWidget(self.vk_delay_spin)
+        pl.addSpacing(20)
+        pl.addWidget(QLabel("Не больше:"))
+        self.vk_max_spin = QSpinBox()
+        self.vk_max_spin.setRange(1, 1000)
+        self.vk_max_spin.setSuffix(" видео за раз")
+        self.vk_max_spin.valueChanged.connect(lambda _: self._vk_update_summary())
+        pl.addWidget(self.vk_max_spin)
+        pl.addStretch()
+        layout.addWidget(params_group)
+
+        ctrl = QHBoxLayout()
+        self.vk_btn_start = QPushButton("▶ Загрузить в ВК")
+        self.vk_btn_start.setObjectName("primary")
+        self.vk_btn_start.setMinimumHeight(36)
+        self.vk_btn_start.clicked.connect(self.action_vk_start)
+        self.vk_btn_stop = QPushButton("⏹ Остановить")
+        self.vk_btn_stop.setMinimumHeight(36)
+        self.vk_btn_stop.setEnabled(False)
+        self.vk_btn_stop.clicked.connect(self.action_vk_stop)
+        ctrl.addWidget(self.vk_btn_start)
+        ctrl.addWidget(self.vk_btn_stop)
+        layout.addLayout(ctrl)
+
+        self.vk_progress = QProgressBar()
+        self.vk_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.vk_progress.setFormat("Ожидание")
+        self.vk_progress.setValue(0)
+        layout.addWidget(self.vk_progress)
+
+        self.vk_log = QTextEdit()
+        self.vk_log.setReadOnly(True)
+        self.vk_log.setMinimumHeight(100)
+        layout.addWidget(self.vk_log, stretch=1)
+        return widget
+
+    def apply_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget, QDialog {
+                background-color: #2b2b2b;
+                color: #e0e0e0;
+            }
+            QWidget:disabled { color: #6a6a6a; }
+            QGroupBox {
+                border: 1px solid #555;
+                border-radius: 4px;
+                margin-top: 1.2ex;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 4px;
+                color: #b0b0b0;
+            }
+            QPushButton {
+                background-color: #3c3f41;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover { background-color: #4c5052; }
+            QPushButton:pressed { background-color: #2b2b2b; }
+            QPushButton:checked { background-color: #4c5052; }
+            QPushButton:disabled { color: #6a6a6a; border-color: #444; }
+            QPushButton#primary {
+                background-color: #0e639c;
+                border-color: #1177bb;
+                font-weight: bold;
+            }
+            QPushButton#primary:hover { background-color: #1177bb; }
+            QPushButton#primary:disabled { background-color: #3a3d3f; border-color: #444; }
+            QTableWidget, QListWidget {
+                background-color: #1e1e1e;
+                alternate-background-color: #252525;
+                gridline-color: #333;
+                border: 1px solid #555;
+            }
+            QHeaderView::section {
+                background-color: #3c3f41;
+                padding: 4px;
+                border: 1px solid #555;
+            }
+            QTabWidget::pane { border: 1px solid #555; }
+            QTabBar::tab {
+                background: #3c3f41;
+                border: 1px solid #555;
+                padding: 6px 14px;
+            }
+            QTabBar::tab:selected { background: #4c5052; }
+            QTextEdit {
+                background-color: #1e1e1e;
+                border: 1px solid #555;
+                font-family: monospace;
+            }
+            QLineEdit, QSpinBox, QComboBox {
+                background-color: #1e1e1e;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 3px 5px;
+            }
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 4px;
+                text-align: center;
+            }
+            QProgressBar::chunk { background-color: #007acc; }
+            QToolTip {
+                background-color: #3c3f41;
+                color: #e0e0e0;
+                border: 1px solid #555;
+            }
+        """)
+
+    # ------------------------------------------------------------------
+    # Data sync
+    # ------------------------------------------------------------------
+
+    def _apply_values_to_ui(self, data: dict):
+        """Fill all processing + VK widgets from a settings/preset dict."""
+        self._ui_loading = True
+        try:
+            # Cut
+            dur = data.get("segment_duration_min", 16)
+            if dur in DURATION_PRESETS:
+                self.cb_duration.setCurrentIndex(DURATION_PRESETS.index(dur))
+            else:
+                self.cb_duration.setCurrentIndex(len(DURATION_PRESETS))
+            self.spin_duration.setValue(dur)
+            self._on_duration_type_changed(self.cb_duration.currentIndex())
+
+            # Output
+            sub = data.get("output_subfolder", "output") or "output"
+            if Path(sub).is_absolute():
+                self.rb_out_custom.setChecked(True)
+                self.out_path.set_path(sub)
+            else:
+                self.rb_out_near.setChecked(True)
+                self.out_path.set_path("")
+            self._on_output_mode_changed()
+
+            # Intro / outro
+            self.chk_intro.setChecked(data.get("intro_enabled", False))
+            self.chk_outro.setChecked(data.get("outro_enabled", False))
+            self.intro_path.set_path(data.get("intro_path", ""))
+            self.outro_path.set_path(data.get("outro_path", ""))
+            self.intro_path.setEnabled(self.chk_intro.isChecked())
+            self.outro_path.setEnabled(self.chk_outro.isChecked())
+
+            # Logo
+            self.chk_logo.setChecked(data.get("logo_enabled", False))
+            self.logo_box.setEnabled(self.chk_logo.isChecked())
+            self._logos_data = [dict(d) for d in data.get("logos", [])]
+            self._refresh_logos_list()
+
+            # Video
+            combo_select_data(self.cb_res, data.get("resolution", "source"))
+            self.spin_res_w.setValue(data.get("custom_resolution_w", 1920))
+            self.spin_res_h.setValue(data.get("custom_resolution_h", 1080))
+            self._on_res_changed()
+            combo_select_data(self.cb_fps, str(data.get("fps", "source")))
+            combo_select_data(self.cb_codec, data.get("codec", "libx264"),
+                              self.cb_codec.findData("libx264"))
+            combo_select_data(self.cb_workers, data.get("parallel_workers", 2), 1)
+
+            # Shorts
+            self.chk_shorts.setChecked(data.get("shorts_enabled", False))
+            self.shorts_box.setEnabled(self.chk_shorts.isChecked())
+            combo_select_data(self.cb_shorts_res, data.get("shorts_resolution", "1080x1920"))
+            combo_select_data(self.cb_shorts_fit, data.get("shorts_fit", "blur_sides"))
+
+            # Sound
+            self.chk_sound.setChecked(data.get("sound_overlay_enabled", False))
+            self.sound_box.setEnabled(self.chk_sound.isChecked())
+            self._sounds_data = [dict(d) for d in data.get("sound_overlays", [])]
+            self._refresh_sounds_list()
+
+            # VK (not part of presets — only present in full settings)
+            if "vk_token" in data:
+                self.vk_token_edit.setText(data.get("vk_token", ""))
+                self.vk_group_edit.setText(data.get("vk_group_id", ""))
+                self.vk_folder.set_path(data.get("vk_video_folder", ""))
+                self.vk_titles.set_path(data.get("vk_titles_file", ""))
+                self.vk_delay_spin.setValue(data.get("vk_delay_sec", 10))
+                self.vk_max_spin.setValue(data.get("vk_max_videos", 150))
+                self._vk_update_summary()
+        finally:
+            self._ui_loading = False
+
+    def _collect_ui_values(self) -> dict:
+        dur = self.cb_duration.currentData()
+        if self.rb_out_custom.isChecked() and self.out_path.path():
+            output_sub = self.out_path.path()
+        else:
+            output_sub = "output"
+        return {
+            "segment_duration_min": dur if dur is not None else self.spin_duration.value(),
+            "output_subfolder": output_sub,
+            "intro_enabled": self.chk_intro.isChecked(),
+            "outro_enabled": self.chk_outro.isChecked(),
+            "intro_path": self.intro_path.path(),
+            "outro_path": self.outro_path.path(),
+            "logo_enabled": self.chk_logo.isChecked(),
+            "logos": [dict(d) for d in self._logos_data],
+            "resolution": self.cb_res.currentData(),
+            "custom_resolution_w": self.spin_res_w.value(),
+            "custom_resolution_h": self.spin_res_h.value(),
+            "fps": self.cb_fps.currentData(),
+            "codec": self.cb_codec.currentData(),
+            "parallel_workers": self.cb_workers.currentData() or 2,
+            "shorts_enabled": self.chk_shorts.isChecked(),
+            "shorts_resolution": self.cb_shorts_res.currentData(),
+            "shorts_fit": self.cb_shorts_fit.currentData(),
+            "sound_overlay_enabled": self.chk_sound.isChecked(),
+            "sound_overlays": [dict(d) for d in self._sounds_data],
+            "vk_token": self.vk_token_edit.text().strip(),
+            "vk_group_id": self.vk_group_edit.text().strip(),
+            "vk_video_folder": self.vk_folder.path(),
+            "vk_titles_file": self.vk_titles.path(),
+            "vk_delay_sec": self.vk_delay_spin.value(),
+            "vk_max_videos": self.vk_max_spin.value(),
+        }
+
+    def _save_ui_to_settings(self, *_):
+        if self._ui_loading:
+            return
+        self.settings.update(self._collect_ui_values())
+        self._update_preset_dirty()
+
+    def _connect_ui_to_settings(self):
+        save = self._save_ui_to_settings
+        for combo in (self.cb_duration, self.cb_res, self.cb_fps, self.cb_codec, self.cb_workers,
+                      self.cb_shorts_res, self.cb_shorts_fit):
+            combo.currentIndexChanged.connect(save)
+        for spin in (self.spin_duration, self.spin_res_w, self.spin_res_h,
+                     self.vk_delay_spin, self.vk_max_spin):
+            spin.valueChanged.connect(save)
+        for chk in (self.chk_intro, self.chk_outro, self.chk_logo, self.chk_shorts,
+                    self.chk_sound, self.rb_out_near):
+            chk.toggled.connect(save)
+        for pf in (self.intro_path, self.outro_path, self.out_path, self.vk_folder, self.vk_titles):
+            pf.pathChanged.connect(save)
+        self.vk_token_edit.textChanged.connect(save)
+        self.vk_group_edit.textChanged.connect(save)
+
+    # ------------------------------------------------------------------
+    # Small UI reactions
+    # ------------------------------------------------------------------
+
+    def _on_duration_type_changed(self, idx: int):
+        self.spin_duration.setVisible(self.cb_duration.itemData(idx) is None)
+
+    def _on_res_changed(self, *_):
+        custom = self.cb_res.currentData() == "custom"
+        for w in (self.spin_res_w, self.lbl_res_x, self.spin_res_h):
+            w.setVisible(custom)
+
+    def _on_output_mode_changed(self, *_):
+        self.out_path.setEnabled(self.rb_out_custom.isChecked())
+
+    def _on_output_path_picked(self, path: str):
+        if path:
+            self.rb_out_custom.setChecked(True)
+
+    def _update_queue_buttons(self):
+        self.btn_remove.setEnabled(not self._running and bool(self.table.selectedItems()))
+
+    # ------------------------------------------------------------------
+    # Logos & sounds
+    # ------------------------------------------------------------------
 
     def _refresh_logos_list(self):
         self.list_logos.clear()
         for i, ld in enumerate(self._logos_data):
             p = ld.get("path", "")
-            name = Path(p).name if p else "Не выбран"
-            pos = ld.get("position", "")
-            self.list_logos.addItem(f"{i+1}. {name} [{pos}]")
+            name = Path(p).name if p else "файл не выбран"
+            missing = " ⚠ файл не найден" if p and not Path(p).is_file() else ""
+            pos = POSITION_NAMES.get(ld.get("position", ""), ld.get("position", ""))
+            when = LOGO_DISPLAY_NAMES.get(ld.get("display", "full"), "")
+            self.list_logos.addItem(
+                f"{i + 1}. {name} — {pos.lower()}, {ld.get('size', 15)}%, {when.lower()}{missing}")
 
     def _action_add_logo(self):
         dlg = LogoEditDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._logos_data.append(dlg.get_data())
+            self.chk_logo.setChecked(True)
             self._refresh_logos_list()
             self._save_ui_to_settings()
 
     def _action_edit_logo(self):
         r = self.list_logos.currentRow()
-        if r < 0 or r >= len(self._logos_data): return
+        if not 0 <= r < len(self._logos_data):
+            return
         dlg = LogoEditDialog(self, self._logos_data[r])
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._logos_data[r] = dlg.get_data()
@@ -579,157 +1255,33 @@ class MainWindow(QMainWindow):
 
     def _action_remove_logo(self):
         r = self.list_logos.currentRow()
-        if r >= 0 and r < len(self._logos_data):
+        if 0 <= r < len(self._logos_data):
             del self._logos_data[r]
             self._refresh_logos_list()
             self._save_ui_to_settings()
-
-    def _create_video_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        grp = QGroupBox("Настройки видео")
-        glayout = QVBoxLayout(grp)
-
-        # Resolution
-        h_res = QHBoxLayout()
-        h_res.addWidget(QLabel("Разрешение:"))
-        self.cb_res = QComboBox()
-        self.cb_res.addItems(["source", "1280x720", "1920x1080", "2560x1440", "3840x2160", "custom"])
-        self.cb_res.currentIndexChanged.connect(self._on_res_changed)
-        h_res.addWidget(self.cb_res)
-
-        self.spin_res_w = QSpinBox()
-        self.spin_res_w.setRange(320, 7680)
-        self.spin_res_w.setVisible(False)
-        self.spin_res_h = QSpinBox()
-        self.spin_res_h.setRange(240, 4320)
-        self.spin_res_h.setVisible(False)
-        h_res.addWidget(self.spin_res_w)
-        h_res.addWidget(self.spin_res_h)
-        h_res.addStretch()
-        glayout.addLayout(h_res)
-
-        # FPS
-        h_fps = QHBoxLayout()
-        h_fps.addWidget(QLabel("FPS:"))
-        self.cb_fps = QComboBox()
-        self.cb_fps.addItems(["source", "24", "30", "60"])
-        h_fps.addWidget(self.cb_fps)
-        h_fps.addStretch()
-        glayout.addLayout(h_fps)
-
-        # Codec
-        h_codec = QHBoxLayout()
-        h_codec.addWidget(QLabel("Кодек:"))
-        self.cb_codec = QComboBox()
-        self.cb_codec.addItem("h264_nvenc (NVIDIA)", "h264_nvenc")
-        self.cb_codec.addItem("hevc_nvenc (NVIDIA)", "hevc_nvenc")
-        self.cb_codec.addItem("h264_qsv (Intel QuickSync)", "h264_qsv")
-        self.cb_codec.addItem("hevc_qsv (Intel QuickSync)", "hevc_qsv")
-        self.cb_codec.addItem("h264_amf (AMD)", "h264_amf")
-        self.cb_codec.addItem("hevc_amf (AMD)", "hevc_amf")
-        self.cb_codec.addItem("h264_videotoolbox (Mac)", "h264_videotoolbox")
-        self.cb_codec.addItem("hevc_videotoolbox (Mac)", "hevc_videotoolbox")
-        self.cb_codec.addItem("libx264 (Процессор)", "libx264")
-        self.cb_codec.addItem("libx265 (Процессор)", "libx265")
-        h_codec.addWidget(self.cb_codec)
-        h_codec.addStretch()
-        glayout.addLayout(h_codec)
-
-        # Parallel Workers
-        h_workers = QHBoxLayout()
-        h_workers.addWidget(QLabel("Параллельные потоки:"))
-        self.cb_workers = QComboBox()
-        self.cb_workers.addItem("1 поток (последовательно)", 1)
-        self.cb_workers.addItem("2 потока (рекомендуется)", 2)
-        self.cb_workers.addItem("3 потока (для мощных GPU)", 3)
-        self.cb_workers.addItem("4 потока", 4)
-        h_workers.addWidget(self.cb_workers)
-        h_workers.addStretch()
-        glayout.addLayout(h_workers)
-
-        layout.addWidget(grp)
-
-        # ---- Shorts group ----
-        grp_shorts = QGroupBox("Shorts / Вертикальное видео")
-        sl = QVBoxLayout(grp_shorts)
-
-        self.chk_shorts = QCheckBox("Конвертировать в Shorts (9:16 вертикальное)")
-        sl.addWidget(self.chk_shorts)
-
-        h_sres = QHBoxLayout()
-        h_sres.addWidget(QLabel("Разрешение:"))
-        self.cb_shorts_res = QComboBox()
-        self.cb_shorts_res.addItems(["1080x1920", "720x1280"])
-        h_sres.addWidget(self.cb_shorts_res)
-        h_sres.addStretch()
-        sl.addLayout(h_sres)
-
-        h_sfit = QHBoxLayout()
-        h_sfit.addWidget(QLabel("Режим:"))
-        self.cb_shorts_fit = QComboBox()
-        self.cb_shorts_fit.addItem("Размытый фон по бокам", "blur_sides")
-        self.cb_shorts_fit.addItem("Обрезка по центру", "crop_center")
-        self.cb_shorts_fit.addItem("Чёрные полосы", "black_bars")
-        h_sfit.addWidget(self.cb_shorts_fit)
-        h_sfit.addStretch()
-        sl.addLayout(h_sfit)
-
-        layout.addWidget(grp_shorts)
-        layout.addStretch()
-        return widget
-
-
-    def _create_sound_tab(self) -> QWidget:
-        """Вкладка наложения звука поверх оригинальной дорожки."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        self.chk_sound = QCheckBox("Наложить звук поверх оригинала")
-        layout.addWidget(self.chk_sound)
-
-        self.list_sounds = QListWidget()
-        layout.addWidget(self.list_sounds)
-
-        h_btns = QHBoxLayout()
-        btn_add_snd = QPushButton("Добавить")
-        btn_add_snd.clicked.connect(self._action_add_sound)
-        h_btns.addWidget(btn_add_snd)
-
-        btn_edit_snd = QPushButton("Изменить")
-        btn_edit_snd.clicked.connect(self._action_edit_sound)
-        h_btns.addWidget(btn_edit_snd)
-
-        btn_del_snd = QPushButton("Удалить")
-        btn_del_snd.clicked.connect(self._action_remove_sound)
-        h_btns.addWidget(btn_del_snd)
-
-        layout.addLayout(h_btns)
-
-        self._sounds_data = []
-        return widget
 
     def _refresh_sounds_list(self):
         self.list_sounds.clear()
         for i, sd in enumerate(self._sounds_data):
             p = sd.get("path", "")
-            name = Path(p).name if p else "Не выбран"
-            start = sd.get("start_sec", 0)
-            vol = int(sd.get("volume", 0.8) * 100)
-            loop_s = " 🔁" if sd.get("loop") else ""
-            self.list_sounds.addItem(f"{i+1}. {name}  |  старт: {start}с  |  громк: {vol}%{loop_s}")
+            name = Path(p).name if p else "файл не выбран"
+            missing = " ⚠ файл не найден" if p and not Path(p).is_file() else ""
+            vol = int(round(sd.get("volume", 0.8) * 100))
+            loop_s = ", по кругу" if sd.get("loop") else ""
+            self.list_sounds.addItem(
+                f"{i + 1}. {name} — с {sd.get('start_sec', 0)} сек, громкость {vol}%{loop_s}{missing}")
 
     def _action_add_sound(self):
         dlg = SoundOverlayDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._sounds_data.append(dlg.get_data())
+            self.chk_sound.setChecked(True)
             self._refresh_sounds_list()
             self._save_ui_to_settings()
 
     def _action_edit_sound(self):
         r = self.list_sounds.currentRow()
-        if r < 0 or r >= len(self._sounds_data):
+        if not 0 <= r < len(self._sounds_data):
             return
         dlg = SoundOverlayDialog(self, self._sounds_data[r])
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -744,520 +1296,201 @@ class MainWindow(QMainWindow):
             self._refresh_sounds_list()
             self._save_ui_to_settings()
 
-
-    def _create_vk_tab(self) -> QWidget:
-        """Вкладка загрузки видео в ВКонтакте."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(8)
-
-        # --- Авторизация ---
-        auth_group = QGroupBox("Авторизация")
-        auth_layout = QVBoxLayout(auth_group)
-
-        h_token = QHBoxLayout()
-        h_token.addWidget(QLabel("Токен ВК:"))
-        self.vk_token_edit = QLineEdit()
-        self.vk_token_edit.setPlaceholderText("vk1.a.xxxxxxxxxxxx...")
-        self.vk_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        h_token.addWidget(self.vk_token_edit, stretch=1)
-        auth_layout.addLayout(h_token)
-
-        h_group = QHBoxLayout()
-        h_group.addWidget(QLabel("ID группы (пусто = личная страница):"))
-        self.vk_group_edit = QLineEdit()
-        self.vk_group_edit.setPlaceholderText("123456789")
-        h_group.addWidget(self.vk_group_edit, stretch=1)
-        auth_layout.addLayout(h_group)
-
-        layout.addWidget(auth_group)
-
-        # --- Источник видео ---
-        src_group = QGroupBox("Исходные файлы")
-        src_layout = QVBoxLayout(src_group)
-
-        h_folder = QHBoxLayout()
-        h_folder.addWidget(QLabel("Папка с видео:"))
-        self.vk_folder_lbl = QLabel("Не выбрана")
-        self.vk_folder_lbl.setWordWrap(True)
-        btn_folder = QPushButton("Обзор...")
-        btn_folder.clicked.connect(self._vk_browse_folder)
-        h_folder.addWidget(self.vk_folder_lbl, stretch=1)
-        h_folder.addWidget(btn_folder)
-        src_layout.addLayout(h_folder)
-
-        h_titles = QHBoxLayout()
-        h_titles.addWidget(QLabel("Файл с названиями:"))
-        self.vk_titles_lbl = QLabel("Не выбран")
-        self.vk_titles_lbl.setWordWrap(True)
-        btn_titles = QPushButton("Обзор...")
-        btn_titles.clicked.connect(self._vk_browse_titles)
-        h_titles.addWidget(self.vk_titles_lbl, stretch=1)
-        h_titles.addWidget(btn_titles)
-        src_layout.addLayout(h_titles)
-
-        layout.addWidget(src_group)
-
-        # --- Параметры загрузки ---
-        params_group = QGroupBox("Параметры")
-        params_layout = QHBoxLayout(params_group)
-
-        params_layout.addWidget(QLabel("Пауза (сек):"))
-        self.vk_delay_spin = QSpinBox()
-        self.vk_delay_spin.setRange(1, 300)
-        self.vk_delay_spin.setValue(10)
-        params_layout.addWidget(self.vk_delay_spin)
-
-        params_layout.addSpacing(20)
-        params_layout.addWidget(QLabel("Макс. видео за сессию:"))
-        self.vk_max_spin = QSpinBox()
-        self.vk_max_spin.setRange(1, 1000)
-        self.vk_max_spin.setValue(150)
-        params_layout.addWidget(self.vk_max_spin)
-        params_layout.addStretch()
-
-        layout.addWidget(params_group)
-
-        # --- Управление ---
-        ctrl_layout = QHBoxLayout()
-        self.vk_btn_start = QPushButton("▶ Загрузить в ВК")
-        self.vk_btn_start.setMinimumHeight(36)
-        self.vk_btn_start.clicked.connect(self.action_vk_start)
-        self.vk_btn_stop = QPushButton("⏹ Остановить")
-        self.vk_btn_stop.setMinimumHeight(36)
-        self.vk_btn_stop.setEnabled(False)
-        self.vk_btn_stop.clicked.connect(self.action_vk_stop)
-        ctrl_layout.addWidget(self.vk_btn_start)
-        ctrl_layout.addWidget(self.vk_btn_stop)
-        layout.addLayout(ctrl_layout)
-
-        # --- Прогресс ---
-        self.vk_progress = QProgressBar()
-        self.vk_progress.setTextVisible(True)
-        self.vk_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.vk_progress.setFormat("Файл %v из %m")
-        layout.addWidget(self.vk_progress)
-
-        # --- Лог ---
-        self.vk_log = QTextEdit()
-        self.vk_log.setReadOnly(True)
-        layout.addWidget(self.vk_log, stretch=1)
-
-        return widget
-
-    def apply_theme(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-            }
-            QGroupBox {
-                border: 1px solid #555;
-                border-radius: 4px;
-                margin-top: 1ex;
-                padding-top: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 3px;
-                color: #a0a0a0;
-            }
-            QPushButton {
-                background-color: #3c3f41;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 5px 15px;
-            }
-            QPushButton:hover {
-                background-color: #4c5052;
-            }
-            QPushButton:pressed {
-                background-color: #2b2b2b;
-            }
-            QTableWidget {
-                background-color: #1e1e1e;
-                alternate-background-color: #2a2a2a;
-                gridline-color: #333;
-                border: 1px solid #555;
-            }
-            QHeaderView::section {
-                background-color: #3c3f41;
-                padding: 4px;
-                border: 1px solid #555;
-            }
-            QTabWidget::pane {
-                border: 1px solid #555;
-            }
-            QTabBar::tab {
-                background: #3c3f41;
-                border: 1px solid #555;
-                padding: 5px 15px;
-            }
-            QTabBar::tab:selected {
-                background: #4c5052;
-            }
-            QTextEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #555;
-                font-family: monospace;
-            }
-            QProgressBar {
-                border: 1px solid #555;
-                border-radius: 4px;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #007acc;
-            }
-        """)
-
     # ------------------------------------------------------------------
-    # Data sync
-    # ------------------------------------------------------------------
-    
-    def _load_settings_to_ui(self):
-        s = self.settings
-        
-        # Cut
-        dur = s.get("segment_duration_min", 16)
-        dur_map = {5: 0, 10: 1, 16: 2, 20: 3, 30: 4}
-        if dur in dur_map:
-            self.cb_duration.setCurrentIndex(dur_map[dur])
-            self.spin_duration.setValue(dur)
-        else:
-            self.cb_duration.setCurrentIndex(5)
-            self.spin_duration.setValue(dur)
-            
-        # IO
-        self.chk_intro.setChecked(s.get("intro_enabled", False))
-        self.chk_outro.setChecked(s.get("outro_enabled", False))
-        self.lbl_intro_path.setText(s.get("intro_path", "Путь не выбран") or "Путь не выбран")
-        self.lbl_outro_path.setText(s.get("outro_path", "Путь не выбран") or "Путь не выбран")
-        
-        # Logo
-        self.chk_logo.setChecked(s.get("logo_enabled", False))
-        self._logos_data = list(s.get("logos", []))
-        self._refresh_logos_list()
-        
-        # Video
-        self.cb_res.setCurrentText(s.get("resolution", "source"))
-        self.spin_res_w.setValue(s.get("custom_resolution_w", 1920))
-        self.spin_res_h.setValue(s.get("custom_resolution_h", 1080))
-        self.cb_fps.setCurrentText(s.get("fps", "source"))
-
-        codec_val = s.get("codec", "h264_nvenc")
-        idx = self.cb_codec.findData(codec_val)
-        if idx >= 0:
-            self.cb_codec.setCurrentIndex(idx)
-        else:
-            self.cb_codec.setCurrentIndex(0)
-
-        workers_val = s.get("parallel_workers", 2)
-        w_idx = self.cb_workers.findData(workers_val)
-        self.cb_workers.setCurrentIndex(w_idx if w_idx >= 0 else 1)
-
-        # Shorts
-        self.chk_shorts.setChecked(s.get("shorts_enabled", False))
-        self.cb_shorts_res.setCurrentText(s.get("shorts_resolution", "1080x1920"))
-        fit_idx = self.cb_shorts_fit.findData(s.get("shorts_fit", "blur_sides"))
-        self.cb_shorts_fit.setCurrentIndex(fit_idx if fit_idx >= 0 else 0)
-
-        # Sound overlay
-        self.chk_sound.setChecked(s.get("sound_overlay_enabled", False))
-        self._sounds_data = list(s.get("sound_overlays", []))
-        self._refresh_sounds_list()
-
-        # VK
-        self.vk_token_edit.setText(s.get("vk_token", ""))
-        self.vk_group_edit.setText(s.get("vk_group_id", ""))
-        self.vk_titles_lbl.setText(s.get("vk_titles_file", "") or "Не выбран")
-        self.vk_folder_lbl.setText(s.get("vk_video_folder", "") or "Не выбрана")
-        self.vk_delay_spin.setValue(s.get("vk_delay_sec", 10))
-        self.vk_max_spin.setValue(s.get("vk_max_videos", 150))
-
-    def _save_ui_to_settings(self):
-        s = self.settings
-        
-        # Cut
-        idx = self.cb_duration.currentIndex()
-        if idx == 5:
-            s.set("segment_duration_min", self.spin_duration.value())
-        else:
-            val = [5, 10, 16, 20, 30][idx]
-            s.set("segment_duration_min", val)
-            
-        # IO
-        s.set("intro_enabled", self.chk_intro.isChecked())
-        s.set("outro_enabled", self.chk_outro.isChecked())
-        
-        # Logo
-        s.set("logo_enabled", self.chk_logo.isChecked())
-        s.set("logos", self._logos_data)
-        
-        # Video
-        s.set("resolution", self.cb_res.currentText())
-        s.set("custom_resolution_w", self.spin_res_w.value())
-        s.set("custom_resolution_h", self.spin_res_h.value())
-        s.set("fps", self.cb_fps.currentText())
-        s.set("codec", self.cb_codec.currentData())
-        s.set("parallel_workers", self.cb_workers.currentData() or 2)
-
-        # Shorts
-        s.set("shorts_enabled", self.chk_shorts.isChecked())
-        s.set("shorts_resolution", self.cb_shorts_res.currentText())
-        s.set("shorts_fit", self.cb_shorts_fit.currentData())
-
-        # Sound overlay
-        s.set("sound_overlay_enabled", self.chk_sound.isChecked())
-        s.set("sound_overlays", self._sounds_data)
-
-        # VK
-        s.set("vk_token", self.vk_token_edit.text().strip())
-        s.set("vk_group_id", self.vk_group_edit.text().strip())
-        s.set("vk_delay_sec", self.vk_delay_spin.value())
-        s.set("vk_max_videos", self.vk_max_spin.value())
-
-    def _connect_ui_to_settings(self):
-        # Trigger save on any relevant change
-        self.cb_duration.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.spin_duration.valueChanged.connect(self._save_ui_to_settings)
-        
-        self.chk_intro.toggled.connect(self._save_ui_to_settings)
-        self.chk_outro.toggled.connect(self._save_ui_to_settings)
-        
-        self.chk_logo.toggled.connect(self._save_ui_to_settings)
-
-        
-        self.cb_res.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.spin_res_w.valueChanged.connect(self._save_ui_to_settings)
-        self.spin_res_h.valueChanged.connect(self._save_ui_to_settings)
-        self.cb_fps.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.cb_codec.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.cb_workers.currentIndexChanged.connect(self._save_ui_to_settings)
-
-        # Shorts
-        self.chk_shorts.toggled.connect(self._save_ui_to_settings)
-        self.cb_shorts_res.currentIndexChanged.connect(self._save_ui_to_settings)
-        self.cb_shorts_fit.currentIndexChanged.connect(self._save_ui_to_settings)
-
-        # Sound overlay
-        self.chk_sound.toggled.connect(self._save_ui_to_settings)
-
-        # VK
-        self.vk_token_edit.textChanged.connect(self._save_ui_to_settings)
-        self.vk_group_edit.textChanged.connect(self._save_ui_to_settings)
-        self.vk_delay_spin.valueChanged.connect(self._save_ui_to_settings)
-        self.vk_max_spin.valueChanged.connect(self._save_ui_to_settings)
-
-    # ------------------------------------------------------------------
-    # GPU Detection & Elapsed Timer
+    # GPU Detection
     # ------------------------------------------------------------------
 
     def _detect_gpu_encoders(self):
-        """Run GPU encoder detection in a background thread."""
         def _worker():
             try:
-                self._available_encoders = detect_available_encoders(get_ffmpeg_path())
+                result = detect_available_encoders(get_ffmpeg_path())
             except Exception:
-                self._available_encoders = {}
-            # Schedule UI update on the main thread
-            QTimer.singleShot(0, self._on_encoders_detected)
+                result = {}
+            self.encoders_detected.emit(result)   # queued to GUI thread
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_encoders_detected(self):
-        """Update codec combo: mark unavailable encoders."""
+    def _codec_available(self, codec: str) -> bool:
+        if codec in CPU_CODECS:
+            return True
+        return self._available_encoders.get(codec, True)
+
+    def _on_encoders_detected(self, encoders: dict):
+        self._available_encoders = encoders or {}
         if not self._available_encoders:
+            self.lbl_codec_status.setText("Не удалось проверить кодеки (ffmpeg не найден?).")
             return
+
+        model = self.cb_codec.model()
+        hw_ok = []
         for i in range(self.cb_codec.count()):
-            codec_val = self.cb_codec.itemData(i)
-            if codec_val in self._available_encoders:
-                if not self._available_encoders[codec_val]:
-                    txt = self.cb_codec.itemText(i)
-                    if "(недоступен)" not in txt:
-                        self.cb_codec.setItemText(i, f"{txt} (недоступен)")
+            codec = self.cb_codec.itemData(i)
+            item = model.item(i)
+            if self._codec_available(codec):
+                item.setEnabled(True)
+                if codec not in CPU_CODECS:
+                    hw_ok.append(codec)
+            else:
+                item.setEnabled(False)
+                item.setToolTip("Не поддерживается на этом компьютере")
+
+        if hw_ok:
+            names = sorted({self.cb_codec.itemText(self.cb_codec.findData(c)).split(" — ")[0] for c in hw_ok})
+            self.lbl_codec_status.setText(f"✓ Ускорение видеокартой доступно: {', '.join(names)}")
+        else:
+            self.lbl_codec_status.setText("Ускорение видеокартой не найдено — будет использоваться процессор (медленнее).")
+
+        current = self.cb_codec.currentData()
+        if not self._codec_available(current):
+            new = hw_ok[0] if hw_ok else "libx264"
+            self.cb_codec.setCurrentIndex(self.cb_codec.findData(new))
+            self._log_message(
+                f"Кодек «{current}» недоступен на этом компьютере — автоматически выбран "
+                f"«{self.cb_codec.currentText()}».")
+
+    # ------------------------------------------------------------------
+    # Elapsed / ETA
+    # ------------------------------------------------------------------
 
     def _update_elapsed(self):
-        """Called every second by _elapsed_timer while processing."""
         tasks = self.queue_manager.get_tasks()
         if not tasks:
             return
-
-        # Overall elapsed since queue started
         elapsed = time.time() - self._queue_start_time if self._queue_start_time else 0
 
-        # Total chunks across ALL files (all probed upfront, so num_segments is accurate)
         total_chunks = sum(t.num_segments for t in tasks)
         done_chunks = 0
         for t in tasks:
             if t.status == TaskStatus.DONE:
                 done_chunks += t.num_segments
             elif t.status == TaskStatus.PROCESSING:
-                done_chunks += t.current_segment  # completed segments in active task
+                done_chunks += t.current_segment
 
-        # Current encoding speed (from the active task)
-        current_speed = 0.0
-        for t in tasks:
-            if t.status == TaskStatus.PROCESSING and t.speed > 0:
-                current_speed = t.speed
-                break
+        current_speed = next((t.speed for t in tasks
+                              if t.status == TaskStatus.PROCESSING and t.speed > 0), 0.0)
 
-        # ---- Total queue ETA ----
-        # All files already probed → t.duration is known for every task
         total_eta = 0.0
         for t in tasks:
             if t.status == TaskStatus.PROCESSING:
-                # remaining video seconds in this task / encoding speed
                 total_eta += t.eta_sec
-            elif t.status == TaskStatus.PENDING:
-                # entire file still waiting — use current speed
-                if current_speed > 0:
-                    total_eta += t.duration / current_speed
-
-        # Total video remaining (for display)
-        total_video_remaining = 0.0
-        for t in tasks:
-            if t.status == TaskStatus.PROCESSING:
-                total_video_remaining += t.duration * (1.0 - t.progress / 100.0)
-            elif t.status == TaskStatus.PENDING:
-                total_video_remaining += t.duration
+            elif t.status == TaskStatus.PENDING and current_speed > 0:
+                total_eta += t.duration / current_speed
 
         parts = []
-        parts.append(f"Кусков: {done_chunks}/{total_chunks}")
-        parts.append(f"Прошло: {self._fmt_duration(elapsed)}")
+        if self.queue_manager.is_paused:
+            parts.append("⏸ НА ПАУЗЕ")
+        if total_chunks:
+            parts.append(f"Частей готово: {done_chunks} из {total_chunks}")
+        parts.append(f"Прошло: {fmt_duration(elapsed)}")
         if total_eta > 0:
-            parts.append(f"Осталось: ~{self._fmt_duration(total_eta)}")
+            parts.append(f"Осталось примерно: {fmt_duration(total_eta)}")
         if current_speed > 0:
-            parts.append(f"Скорость: {current_speed:.1f}x")
-        if total_video_remaining > 0:
-            parts.append(f"Видео: {self._fmt_duration(total_video_remaining)}")
-
-        self.lbl_eta.setText("  |  ".join(parts))
-
-    @staticmethod
-    def _fmt_duration(seconds: float) -> str:
-        """Format seconds into HH:MM:SS or MM:SS."""
-        s = int(seconds)
-        h, remainder = divmod(s, 3600)
-        m, sec = divmod(remainder, 60)
-        if h:
-            return f"{h}:{m:02d}:{sec:02d}"
-        return f"{m:02d}:{sec:02d}"
-
-    # ------------------------------------------------------------------
-    # UI Logic & Events
-    # ------------------------------------------------------------------
-    
-    def _on_duration_type_changed(self, idx: int):
-        self.spin_duration.setEnabled(idx == 5)
-        
-    def _on_logo_time_changed(self, idx: int):
-        self.w_logo_times.setVisible(idx != 0) # hide if "full"
-        
-    def _on_res_changed(self, idx: int):
-        txt = self.cb_res.currentText()
-        show_custom = (txt == "custom")
-        self.spin_res_w.setVisible(show_custom)
-        self.spin_res_h.setVisible(show_custom)
-        
-
-        
-    def _browse_file(self, label_widget: QLabel, settings_key: str):
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", filter="Видео (*.mp4 *.mkv *.mov)")
-        if path:
-            label_widget.setText(path)
-            self.settings.set(settings_key, path)
-
-    def _browse_logo(self):
-        is_video = (self.cb_logo_type.currentIndex() == 1)
-        flt = "Видео (*.mp4 *.mkv *.mov)" if is_video else "Картинки (*.png *.jpg *.jpeg)"
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите логотип", filter=flt)
-        if path:
-            self.lbl_logo_path.setText(path)
-            self.settings.set("logo_path", path)
-            self._save_ui_to_settings()
-
-
+            parts.append(f"Скорость: {current_speed:.1f}× от реального времени")
+        self.lbl_eta.setText("   •   ".join(parts))
 
     # ------------------------------------------------------------------
     # VK Uploader
     # ------------------------------------------------------------------
 
-    def _vk_browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку с видео")
-        if folder:
-            self.vk_folder_lbl.setText(folder)
-            self.settings.set("vk_video_folder", folder)
-
-    def _vk_browse_titles(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите файл с названиями", filter="Текстовые файлы (*.txt)"
+    def _vk_collect_files(self) -> list[str]:
+        folder = self.vk_folder.path()
+        if not folder or not os.path.isdir(folder):
+            return []
+        return sorted(
+            (os.path.join(folder, f) for f in os.listdir(folder)
+             if f.lower().endswith(VIDEO_EXTS) and os.path.isfile(os.path.join(folder, f))),
+            key=lambda p: natural_key(os.path.basename(p)),
         )
-        if path:
-            self.vk_titles_lbl.setText(path)
-            self.settings.set("vk_titles_file", path)
+
+    def _vk_read_titles(self) -> list[str]:
+        path = self.vk_titles.path()
+        if not path or not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                return [line.strip() for line in fh if line.strip()]
+        except (OSError, UnicodeDecodeError):
+            return []
+
+    def _vk_update_summary(self, *_):
+        if not self.vk_folder.path() and not self.vk_titles.path():
+            self.vk_summary.setVisible(False)
+            return
+        self.vk_summary.setVisible(True)
+        n_files = len(self._vk_collect_files())
+        n_titles = len(self._vk_read_titles())
+        n = min(n_files, n_titles, self.vk_max_spin.value())
+        text = f"Видео в папке: {n_files}   •   Названий: {n_titles}   •   Будет загружено: {n}"
+        if self.vk_folder.path() and self.vk_titles.path() and n_files != n_titles:
+            text += "\n⚠ Количество видео и названий не совпадает"
+            self.vk_summary.setStyleSheet("color: #e5c07b;")
+        else:
+            self.vk_summary.setStyleSheet(MUTED)
+        self.vk_summary.setText(text)
+
+    def _vk_show_help(self):
+        QMessageBox.information(
+            self, "Токен ВКонтакте",
+            "Токен — это ключ доступа к вашему аккаунту ВК, через который программа загружает видео.\n\n"
+            "• Нужен пользовательский токен с правами: video, groups, offline.\n"
+            "• Обычно он начинается с «vk1.a.».\n"
+            "• Токен хранится только на этом компьютере (в settings.json).\n\n"
+            "⚠ Никому не передавайте токен — с ним можно управлять вашим аккаунтом.\n\n"
+            "Группа: если загружаете в сообщество, укажите его ID — число из адреса "
+            "vk.com/club123456789. Вы должны быть админом или редактором группы."
+        )
 
     def action_vk_start(self):
-        import os, re
-
         token = self.vk_token_edit.text().strip()
         if not token:
-            QMessageBox.warning(self, "ВКонтакте", "Укажите токен ВКонтакте.")
+            QMessageBox.warning(self, "ВКонтакте", "Укажите токен ВКонтакте (кнопка «?» — подробнее).")
+            return
+        if not self.vk_folder.exists():
+            QMessageBox.warning(self, "ВКонтакте", "Выберите папку с видео.")
+            return
+        if not self.vk_titles.exists():
+            QMessageBox.warning(self, "ВКонтакте", "Выберите файл с названиями (.txt).")
             return
 
-        folder = self.vk_folder_lbl.text()
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.warning(self, "ВКонтакте", "Укажите корректную папку с видео.")
-            return
-
-        titles_path = self.vk_titles_lbl.text()
-        if not titles_path or not os.path.isfile(titles_path):
-            QMessageBox.warning(self, "ВКонтакте", "Укажите файл с названиями.")
-            return
-
-        # --- собираем файлы (естественная сортировка) ---
-        def _nat_key(s: str):
-            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
-        exts = (".mp4", ".mov", ".avi", ".mkv", ".webm")
-        files = sorted(
-            [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(exts)],
-            key=lambda p: _nat_key(os.path.basename(p)),
-        )
-
+        files = self._vk_collect_files()
         if not files:
-            QMessageBox.warning(self, "ВКонтакте", "В папке нет видеофайлов.")
+            QMessageBox.warning(self, "ВКонтакте", "В выбранной папке нет видеофайлов.")
             return
-
-        with open(titles_path, "r", encoding="utf-8") as fh:
-            titles = [line.strip() for line in fh if line.strip()]
-
+        titles = self._vk_read_titles()
         if not titles:
-            QMessageBox.warning(self, "ВКонтакте", "Файл с названиями пуст.")
+            QMessageBox.warning(self, "ВКонтакте", "Файл с названиями пуст или не читается (нужна кодировка UTF-8).")
             return
 
-        group_id_str = self.vk_group_edit.text().strip()
-        group_id = int(group_id_str) if group_id_str.isdigit() else None
+        group_text = self.vk_group_edit.text().strip()
+        group_id = None
+        if group_text:
+            group_id = parse_vk_group_id(group_text)
+            if group_id is None:
+                QMessageBox.warning(self, "ВКонтакте",
+                                    "Не понял ID группы. Укажите число, например 123456789.")
+                return
 
         total = min(len(files), len(titles), self.vk_max_spin.value())
+        if len(files) != len(titles):
+            reply = QMessageBox.question(
+                self, "ВКонтакте",
+                f"Видео в папке: {len(files)}, названий: {len(titles)}.\n"
+                f"Будет загружено только {total}. Продолжить?",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         self.vk_progress.setMaximum(total)
         self.vk_progress.setValue(0)
         self.vk_log.clear()
 
         self._vk_uploader = VkUploader(self)
         self._vk_uploader.configure(
-            token=token,
-            files=files,
-            titles=titles,
-            titles_path=titles_path,
-            group_id=group_id,
-            delay=self.vk_delay_spin.value(),
-            max_videos=self.vk_max_spin.value(),
+            token=token, files=files, titles=titles,
+            titles_path=self.vk_titles.path(), group_id=group_id,
+            delay=self.vk_delay_spin.value(), max_videos=self.vk_max_spin.value(),
         )
         self._vk_uploader.progress.connect(self._on_vk_progress)
-        self._vk_uploader.file_done.connect(self._on_vk_file_done)
         self._vk_uploader.log_message.connect(self._on_vk_log)
         self._vk_uploader.finished_all.connect(self._on_vk_finished)
 
@@ -1269,126 +1502,321 @@ class MainWindow(QMainWindow):
         if self._vk_uploader and self._vk_uploader.isRunning():
             self._vk_uploader.cancel()
             self.vk_btn_stop.setEnabled(False)
+            self._on_vk_log("Остановка после текущего видео…")
 
     def _on_vk_progress(self, current: int, total: int, filename: str):
         self.vk_progress.setValue(current)
-        self.vk_progress.setFormat(f"Файл {current} из {total}: {filename}")
-
-    def _on_vk_file_done(self, filename: str, vid_id: str, ok: bool):
-        pass  # подробности уже в лог
+        self.vk_progress.setFormat(f"Видео {current} из {total}: {filename}")
 
     def _on_vk_log(self, text: str):
         self.vk_log.append(text)
-        scrollbar = self.vk_log.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        sb = self.vk_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_vk_finished(self, success: int, errors: int):
         self.vk_btn_start.setEnabled(True)
         self.vk_btn_stop.setEnabled(False)
-        self.vk_progress.setFormat(f"Готово: {success} загружено, {errors} ошибок")
-        QMessageBox.information(
-            self, "ВКонтакте",
-            f"Загрузка завершена.\nУспешно: {success}\nОшибок: {errors}"
-        )
+        self.vk_progress.setFormat(f"Готово: загружено {success}, ошибок {errors}")
+        self._vk_update_summary()
+        QApplication.alert(self)
+        box = QMessageBox.warning if errors else QMessageBox.information
+        box(self, "ВКонтакте", f"Загрузка завершена.\n\nЗагружено: {success}\nОшибок: {errors}"
+            + ("\n\nПодробности — в журнале на вкладке «ВКонтакте»." if errors else ""))
 
     # ------------------------------------------------------------------
     # File Management
     # ------------------------------------------------------------------
 
-    def action_add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Добавить видео", filter="Видео (*.mp4 *.mkv *.mov)")
+    def _queued_paths(self) -> set[str]:
+        return {os.path.normcase(os.path.abspath(t.file_path)) for t in self.queue_manager.get_tasks()}
+
+    def _add_paths(self, paths: list[str]) -> None:
+        """Add files and folders (folder → its video files). Skips duplicates."""
+        files: list[str] = []
+        for p in paths:
+            if os.path.isdir(p):
+                found = [os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTS)]
+                files.extend(sorted(found, key=lambda x: natural_key(os.path.basename(x))))
+            elif p.lower().endswith(VIDEO_EXTS):
+                files.append(p)
+
+        existing = self._queued_paths()
+        added = skipped = 0
         for f in files:
+            key = os.path.normcase(os.path.abspath(f))
+            if key in existing:
+                skipped += 1
+                continue
+            existing.add(key)
             self._add_file_to_queue(f)
+            added += 1
+
+        if added or skipped:
+            msg = f"Добавлено в очередь: {added}"
+            if skipped:
+                msg += f" (пропущено, уже в очереди: {skipped})"
+            self._log_message(msg)
+        elif paths:
+            self._log_message("Видеофайлы не найдены. Поддерживаются: " + ", ".join(VIDEO_EXTS))
+        self._update_queue_summary()
+
+    def action_add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Добавить видео", "", VIDEO_FILTER)
+        if files:
+            self._add_paths(files)
 
     def action_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Добавить папку")
+        folder = QFileDialog.getExistingDirectory(self, "Добавить все видео из папки")
         if folder:
-            import os
-            for file in os.listdir(folder):
-                if file.lower().endswith(('.mp4', '.mkv', '.mov')):
-                    self._add_file_to_queue(os.path.join(folder, file))
-                    
+            self._add_paths([folder])
+
     def _add_file_to_queue(self, path: str):
-        idx = self.queue_manager.add_task(path)
-        
+        self.queue_manager.add_task(path)
         row = self.table.rowCount()
         self.table.insertRow(row)
-        
-        item_name = QTableWidgetItem(Path(path).name)
-        item_dur = QTableWidgetItem("---")
-        item_status = QTableWidgetItem(TaskStatus.PENDING.value)
-        item_prog = QTableWidgetItem("0%")
-        
-        # Store index in data
-        item_name.setData(Qt.ItemDataRole.UserRole, idx)
-        
-        self.table.setItem(row, 0, item_name)
-        self.table.setItem(row, 1, item_dur)
-        self.table.setItem(row, 2, item_status)
-        self.table.setItem(row, 3, item_prog)
-        
-    def action_remove_files(self):
-        # Get selected rows
-        rows = sorted(list(set(item.row() for item in self.table.selectedItems())), reverse=True)
-        for r in rows:
-            idx = self.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
-            self.queue_manager.remove_task(idx)
-            self.table.removeRow(r)
-            
-        # Re-sync UI with queue (re-add all to fix indices)
+        name = QTableWidgetItem(Path(path).name)
+        name.setToolTip(path)
+        self.table.setItem(row, self.COL_NAME, name)
+        self.table.setItem(row, self.COL_DUR, QTableWidgetItem("—"))
+        self.table.setItem(row, self.COL_STATUS, QTableWidgetItem(TaskStatus.PENDING.value))
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar.setFormat("")
+        self.table.setCellWidget(row, self.COL_PROGRESS, bar)
+        self._refresh_row(row)
+
+    def _refresh_row(self, row: int):
+        """Row index == task index (kept in sync on add/remove)."""
         tasks = self.queue_manager.get_tasks()
-        self.queue_manager.clear_tasks()
-        self.table.setRowCount(0)
-        for t in tasks:
-            self._add_file_to_queue(t.file_path)
+        if not 0 <= row < len(tasks) or row >= self.table.rowCount():
+            return
+        t = tasks[row]
+        if t.duration > 0:
+            self.table.item(row, self.COL_DUR).setText(fmt_duration(t.duration))
+
+        st = self.table.item(row, self.COL_STATUS)
+        text = t.status.value
+        if t.status == TaskStatus.PROCESSING and self.queue_manager.is_paused:
+            text = "Пауза"
+        st.setText(text)
+        color = QColor(STATUS_COLORS.get(t.status, "#e0e0e0"))
+        st.setForeground(color)
+        tip = t.error_message if t.status == TaskStatus.ERROR else ""
+        st.setToolTip(tip)
+        self.table.item(row, self.COL_NAME).setToolTip(t.file_path + (f"\n\nОшибка: {tip}" if tip else ""))
+
+        bar: QProgressBar = self.table.cellWidget(row, self.COL_PROGRESS)
+        if bar is not None:
+            bar.setValue(int(t.progress * 10))
+            if t.status == TaskStatus.PROCESSING and t.num_segments > 0:
+                bar.setFormat(f"часть {t.current_segment + 1}/{t.num_segments} • {t.progress:.0f}%")
+            elif t.status == TaskStatus.DONE:
+                bar.setFormat(plural(t.num_segments, "часть", "части", "частей") + " ✓" if t.num_segments else "✓")
+            elif t.num_segments > 0 and t.status == TaskStatus.PENDING:
+                bar.setFormat(plural(t.num_segments, "часть", "части", "частей"))
+            else:
+                bar.setFormat(f"{t.progress:.0f}%" if t.progress else "")
+
+    def _update_queue_summary(self):
+        tasks = self.queue_manager.get_tasks()
+        if not tasks:
+            self.lbl_queue_summary.setText("")
+            return
+        total = sum(t.duration for t in tasks)
+        text = f"Файлов: {len(tasks)}"
+        if total > 0:
+            text += f"   •   Общая длительность: {fmt_duration(total)}"
+        done = sum(1 for t in tasks if t.status == TaskStatus.DONE)
+        if done:
+            text += f"   •   Готово: {done}"
+        self.lbl_queue_summary.setText(text)
+
+    def action_remove_files(self):
+        if self._running:
+            return
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.queue_manager.remove_task(r)
+            self.table.removeRow(r)
+        self._update_queue_summary()
+        self._update_queue_buttons()
 
     def action_clear_files(self):
+        if self.queue_manager.task_count() == 0:
+            return
+        reply = QMessageBox.question(self, "Очистить очередь",
+                                     "Убрать все файлы из очереди?\n(Сами файлы на диске не удаляются.)")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         self.queue_manager.clear_tasks()
         self.table.setRowCount(0)
+        self.progress_overall.setValue(0)
+        self.lbl_eta.setText("")
+        self._update_queue_summary()
+
+    # ------------------------------------------------------------------
+    # Output folder
+    # ------------------------------------------------------------------
+
+    def _output_dir_for(self, src_path: str) -> Path:
+        sub = self.settings.get("output_subfolder", "output") or "output"
+        return Path(src_path).parent / sub   # absolute `sub` overrides the parent
+
+    def _open_output_folder(self):
+        tasks = self.queue_manager.get_tasks()
+        target: Path | None = None
+        rows = sorted({i.row() for i in self.table.selectedItems()})
+        if rows and rows[0] < len(tasks):
+            target = self._output_dir_for(tasks[rows[0]].file_path)
+        elif tasks:
+            done = [t for t in tasks if t.status == TaskStatus.DONE]
+            target = self._output_dir_for((done or tasks)[0].file_path)
+        else:
+            sub = self.settings.get("output_subfolder", "output")
+            if sub and Path(sub).is_absolute():
+                target = Path(sub)
+
+        if target is None:
+            QMessageBox.information(self, "Папка с результатом",
+                                    "Добавьте видео в очередь — готовые части появятся в подпапке «output» рядом с ним.")
+            return
+        if not target.is_dir():
+            # nothing produced yet — open the nearest existing parent
+            parent = target.parent
+            if not parent.is_dir():
+                QMessageBox.information(self, "Папка с результатом", f"Папка ещё не создана:\n{target}")
+                return
+            target = parent
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     # ------------------------------------------------------------------
     # Processing Control
     # ------------------------------------------------------------------
 
+    def _validate_settings(self) -> list[str]:
+        problems = []
+        if self.chk_intro.isChecked():
+            if not self.intro_path.path():
+                problems.append("Интро включено, но видео не выбрано (вкладка «Интро / Аутро»).")
+            elif not self.intro_path.exists():
+                problems.append(f"Файл интро не найден: {self.intro_path.path()}")
+        if self.chk_outro.isChecked():
+            if not self.outro_path.path():
+                problems.append("Аутро включено, но видео не выбрано (вкладка «Интро / Аутро»).")
+            elif not self.outro_path.exists():
+                problems.append(f"Файл аутро не найден: {self.outro_path.path()}")
+        if self.chk_logo.isChecked():
+            if not self._logos_data:
+                problems.append("Логотипы включены, но ни одного не добавлено (вкладка «Логотип»).")
+            for i, ld in enumerate(self._logos_data, 1):
+                p = ld.get("path", "")
+                if not p or not Path(p).is_file():
+                    problems.append(f"Логотип №{i}: файл не найден ({p or 'не выбран'}).")
+        if self.chk_sound.isChecked():
+            if not self._sounds_data:
+                problems.append("Наложение звука включено, но ни одного файла не добавлено (вкладка «Звук»).")
+            for i, sd in enumerate(self._sounds_data, 1):
+                p = sd.get("path", "")
+                if not p or not Path(p).is_file():
+                    problems.append(f"Звук №{i}: файл не найден ({p or 'не выбран'}).")
+        if self.rb_out_custom.isChecked() and not self.out_path.path():
+            problems.append("Выбрано «В свою папку», но папка не указана (вкладка «Нарезка»).")
+        codec = self.cb_codec.currentData()
+        if not self._codec_available(codec):
+            problems.append(f"Кодек «{self.cb_codec.currentText()}» не работает на этом компьютере (вкладка «Видео»).")
+        missing = [t.filename for t in self.queue_manager.get_tasks()
+                   if t.status != TaskStatus.DONE and not Path(t.file_path).is_file()]
+        if missing:
+            problems.append("Файлы из очереди не найдены на диске: " + ", ".join(missing[:5])
+                            + (" …" if len(missing) > 5 else ""))
+        return problems
+
+    @staticmethod
+    def _reset_task(t):
+        t.status = TaskStatus.PENDING
+        t.progress = 0.0
+        t.current_segment = 0
+        t.error_message = ""
+        t.speed = 0.0
+        t.eta_sec = 0.0
+
     def action_start(self):
-        if self.queue_manager.task_count() == 0:
-            QMessageBox.warning(self, "Внимание", "Очередь пуста.")
+        tasks = self.queue_manager.get_tasks()
+        if not tasks:
+            QMessageBox.information(self, "Очередь пуста",
+                                    "Добавьте видео: кнопка «Добавить файлы…» или перетащите их в окно.")
             return
-            
+
+        problems = self._validate_settings()
+        if problems:
+            QMessageBox.warning(self, "Проверьте настройки",
+                                "Перед запуском нужно исправить:\n\n• " + "\n• ".join(problems))
+            return
+
+        if all(t.status == TaskStatus.DONE for t in tasks):
+            reply = QMessageBox.question(self, "Всё уже готово",
+                                         "Все файлы в очереди уже обработаны.\nОбработать их заново?")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for t in tasks:
+                self._reset_task(t)
+        else:
+            # retry failed / cancelled ones, keep finished
+            for t in tasks:
+                if t.status != TaskStatus.DONE:
+                    self._reset_task(t)
+        for r in range(len(tasks)):
+            self._refresh_row(r)
+
         self._save_ui_to_settings()
-        
-        self.btn_start.setEnabled(False)
-        self.btn_pause.setEnabled(True)
-        self.btn_stop.setEnabled(True)
-        
-        # Disable queue modifications
-        self.btn_add_file.setEnabled(False)
-        self.btn_add_folder.setEnabled(False)
-        self.btn_remove.setEnabled(False)
-        self.btn_clear.setEnabled(False)
-        self.tabs.setEnabled(False)
-        
+        self._stop_requested = False
+        self._set_running(True)
+
         self.log_text.clear()
-        self._log_message("Запуск обработки...")
+        self._log_message("Запуск обработки…")
         self.lbl_eta.setText("")
-        
+        self.progress_overall.setValue(0)
         self._queue_start_time = time.time()
         self._elapsed_timer.start()
-        
         self.queue_manager.start_processing(self.settings.get_all())
-        
+
+    def _set_running(self, running: bool):
+        self._running = running
+        self.btn_start.setEnabled(not running)
+        self.btn_pause.setEnabled(running)
+        self.btn_stop.setEnabled(running)
+        if not running:
+            self.btn_pause.setText("⏸ Пауза")
+        for b in (self.btn_add_file, self.btn_add_folder, self.btn_clear):
+            b.setEnabled(not running)
+        self.setAcceptDrops(not running)
+        for page in self._processing_tabs:
+            page.setEnabled(not running)          # tabs stay viewable; VK tab stays usable
+        for w in self._preset_widgets:
+            w.setEnabled(not running)
+        self._update_queue_buttons()
+
     def action_pause(self):
         if self.queue_manager.is_paused:
             self.queue_manager.resume()
             self.btn_pause.setText("⏸ Пауза")
-            self._log_message("Обработка возобновлена.")
+            self._log_message("Продолжаем.")
         else:
             self.queue_manager.pause()
             self.btn_pause.setText("▶ Продолжить")
-            self._log_message("Обработка приостановлена (после завершения текущего сегмента).")
-            
+            self._log_message("Пауза: текущая часть доделается, следующая не начнётся.")
+        for r in range(self.table.rowCount()):
+            self._refresh_row(r)
+        self._update_elapsed()
+
     def action_stop(self):
-        self._log_message("Остановка (ожидание завершения текущей операции)...")
+        reply = QMessageBox.question(self, "Остановить",
+                                     "Остановить обработку?\nТекущая часть будет прервана, уже готовые части останутся.")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._stop_requested = True
+        self._log_message("Остановка…")
         self.btn_stop.setEnabled(False)
         self.btn_pause.setEnabled(False)
         self.queue_manager.cancel()
@@ -1396,145 +1824,163 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Queue Signals
     # ------------------------------------------------------------------
-    
-    def _find_row_by_task_idx(self, idx: int) -> int:
-        for r in range(self.table.rowCount()):
-            if self.table.item(r, 0).data(Qt.ItemDataRole.UserRole) == idx:
-                return r
-        return -1
 
     def _on_task_updated(self, idx: int):
-        row = self._find_row_by_task_idx(idx)
-        if row < 0: return
-        
-        tasks = self.queue_manager.get_tasks()
-        if idx >= len(tasks): return
-        t = tasks[idx]
-        
-        # update duration
-        if t.duration > 0:
-            m, s = divmod(int(t.duration), 60)
-            h, m = divmod(m, 60)
-            dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-            self.table.item(row, 1).setText(dur_str)
-            
-        self.table.item(row, 2).setText(t.status.value)
-        # Show [Кусок X/Y] Z% in progress column
-        if t.num_segments > 0 and t.status == TaskStatus.PROCESSING:
-            seg_display = t.current_segment + 1
-            self.table.item(row, 3).setText(
-                f"[{seg_display}/{t.num_segments}] {t.progress:.1f}%"
-            )
-        else:
-            self.table.item(row, 3).setText(f"{t.progress:.1f}%")
-        
+        self._refresh_row(idx)
+
     def _on_task_progress(self, task_idx: int, seg_idx: int, percent: float):
-        self._on_task_updated(task_idx)
-        # Update overall roughly
         tasks = self.queue_manager.get_tasks()
-        if not tasks: return
-        
-        total = 100.0 * len(tasks)
-        current = sum(t.progress for t in tasks)
-        self.progress_overall.setValue(int(current / total * 100))
-        
+        if not tasks:
+            return
+        # weight by duration when known, so long streams count more
+        weights = [t.duration if t.duration > 0 else 1.0 for t in tasks]
+        done = sum(w * t.progress / 100.0 for w, t in zip(weights, tasks))
+        self.progress_overall.setValue(int(done / sum(weights) * 100))
+
     def _on_task_completed(self, task_idx: int, success: bool, msg: str):
-        self._on_task_updated(task_idx)
-        if not success:
-            self._log_message(f"Ошибка задачи {task_idx}: {msg}")
-            
+        self._refresh_row(task_idx)
+        if not success and msg != "Отменено":
+            tasks = self.queue_manager.get_tasks()
+            name = tasks[task_idx].filename if task_idx < len(tasks) else f"№{task_idx + 1}"
+            self._log_message(f"❌ Ошибка в «{name}»: {msg}")
+
     def _on_queue_completed(self):
         self._elapsed_timer.stop()
         elapsed = time.time() - self._queue_start_time if self._queue_start_time else 0
-
         tasks = self.queue_manager.get_tasks()
-        total_chunks = sum(t.num_segments for t in tasks)
+        done = [t for t in tasks if t.status == TaskStatus.DONE]
+        errors = [t for t in tasks if t.status == TaskStatus.ERROR]
+        chunks = sum(t.num_segments for t in done)
 
-        self._log_message(
-            f"Обработка всей очереди завершена. "
-            f"Кусков: {total_chunks}, Время: {self._fmt_duration(elapsed)}"
-        )
+        self._set_running(False)
+        for r in range(len(tasks)):
+            self._refresh_row(r)
+        self._update_queue_summary()
+        if not errors and not self._stop_requested:
+            self.progress_overall.setValue(100)
+
+        title = "Остановлено" if self._stop_requested else "Готово"
         self.lbl_eta.setText(
-            f"✅ Готово  |  Кусков: {total_chunks}  |  "
-            f"Общее время: {self._fmt_duration(elapsed)}"
-        )
-        
-        self.btn_start.setEnabled(True)
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.setText("⏸ Пауза")
-        self.btn_stop.setEnabled(False)
-        
-        self.btn_add_file.setEnabled(True)
-        self.btn_add_folder.setEnabled(True)
-        self.btn_remove.setEnabled(True)
-        self.btn_clear.setEnabled(True)
-        self.tabs.setEnabled(True)
-        
-        self.progress_overall.setValue(100)
-        
-    def _on_log_message(self, msg: str):
-        self._log_message(msg)
-        
+            f"{'⏹' if self._stop_requested else '✅'} {title}   •   Файлов: {len(done)} из {len(tasks)}"
+            f"   •   Частей: {chunks}   •   Время: {fmt_duration(elapsed)}"
+            + (f"   •   Ошибок: {len(errors)}" if errors else ""))
+        self._log_message(f"{title}. Файлов: {len(done)}/{len(tasks)}, частей: {chunks}, "
+                          f"время: {fmt_duration(elapsed)}.")
+
+        QApplication.alert(self)
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Icon.Warning if errors else QMessageBox.Icon.Information)
+        text = (f"Обработано файлов: {len(done)} из {len(tasks)}\n"
+                f"Готовых частей: {chunks}\n"
+                f"Затрачено времени: {fmt_duration(elapsed)}")
+        if errors:
+            text += f"\n\nС ошибками: {len(errors)} (наведите на строку в очереди, чтобы увидеть причину)"
+            box.setDetailedText("\n\n".join(f"{t.filename}:\n{t.error_message}" for t in errors))
+        box.setText(text)
+        btn_open = box.addButton("📂 Открыть папку", QMessageBox.ButtonRole.ActionRole) if done else None
+        box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if btn_open is not None and box.clickedButton() is btn_open:
+            self.table.clearSelection()
+            self._open_output_folder()
+
+    # ------------------------------------------------------------------
+    # Log
+    # ------------------------------------------------------------------
+
+    def _resolve_log_path(self) -> Path | None:
+        candidates = [Path(self.settings.path).parent]
+        appdata = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if appdata:
+            candidates.append(Path(appdata))
+        for d in candidates:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                p = d / "debug_log.txt"
+                with open(p, "a", encoding="utf-8"):
+                    pass
+                return p
+            except OSError:
+                continue
+        return None
+
     def _log_message(self, msg: str):
         self.log_text.append(msg)
-        with open("debug_log.txt", "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        sb = self.log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        if self._log_path is None:
+            self._log_path = self._resolve_log_path() or Path()
+        if self._log_path != Path():
+            try:
+                with open(self._log_path, "a", encoding="utf-8") as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Presets
     # ------------------------------------------------------------------
 
     def _build_presets_bar(self) -> QHBoxLayout:
-        """Build and return the horizontal presets toolbar layout."""
         bar = QHBoxLayout()
         bar.setSpacing(6)
-
-        bar.addWidget(QLabel("🎛 Пресет:"))
+        bar.addWidget(QLabel("Пресет:"))
 
         self.cb_presets = QComboBox()
         self.cb_presets.setMinimumWidth(160)
-        self.cb_presets.setToolTip("Выберите пресет для загрузки настроек")
+        self.cb_presets.setToolTip(
+            "Пресет — сохранённый набор настроек обработки (всё, кроме ВК).\n"
+            "Звёздочка * означает, что настройки изменены и не сохранены в пресет.")
         bar.addWidget(self.cb_presets, stretch=1)
 
         btn_save = QPushButton("💾 Сохранить")
-        btn_save.setToolTip("Сохранить текущие настройки как пресет")
+        btn_save.setToolTip("Сохранить текущие настройки в пресет")
         btn_save.clicked.connect(self._action_save_preset)
-        bar.addWidget(btn_save)
-
-        btn_rename = QPushButton("✏️ Переименовать")
-        btn_rename.setToolTip("Переименовать выбранный пресет")
+        btn_rename = QPushButton("✏️")
+        btn_rename.setToolTip("Переименовать пресет")
+        btn_rename.setFixedWidth(36)
         btn_rename.clicked.connect(self._action_rename_preset)
-        bar.addWidget(btn_rename)
-
-        btn_delete = QPushButton("🗑 Удалить")
-        btn_delete.setToolTip("Удалить выбранный пресет")
+        btn_delete = QPushButton("🗑")
+        btn_delete.setToolTip("Удалить пресет")
+        btn_delete.setFixedWidth(36)
         btn_delete.clicked.connect(self._action_delete_preset)
-        bar.addWidget(btn_delete)
+        for b in (btn_save, btn_rename, btn_delete):
+            bar.addWidget(b)
+        self._preset_widgets = [self.cb_presets, btn_save, btn_rename, btn_delete]
 
-        # Fill combo and connect signal AFTER creating buttons
         self._refresh_presets_combo(select_name=self.settings.get("active_preset"))
         self.cb_presets.currentIndexChanged.connect(self._on_preset_selected)
-
         return bar
 
     def _refresh_presets_combo(self, select_name: str | None = None):
-        """Repopulate the presets combo box, optionally selecting *select_name*."""
         self.cb_presets.blockSignals(True)
         self.cb_presets.clear()
-        self.cb_presets.addItem("— не выбрано —", None)
+        self.cb_presets.addItem("— без пресета —", None)
         for name in self.settings.get_preset_names():
             self.cb_presets.addItem(name, name)
-        # Restore selection
         if select_name:
             idx = self.cb_presets.findData(select_name)
             if idx >= 0:
                 self.cb_presets.setCurrentIndex(idx)
         self.cb_presets.blockSignals(False)
+        if hasattr(self, "tab_main"):
+            self._update_preset_dirty()
+
+    def _update_preset_dirty(self):
+        """Mark the active preset with * when current settings differ from it."""
+        idx = self.cb_presets.currentIndex()
+        name = self.cb_presets.itemData(idx)
+        if not name:
+            return
+        data = self.settings.load_preset(name) or {}
+        dirty = any(self.settings.get(k) != v for k, v in data.items())
+        self.cb_presets.setItemText(idx, f"{name} *" if dirty else name)
 
     def _on_preset_selected(self, combo_idx: int):
-        """Load the selected preset into the UI."""
+        # clear stale "*" marks on other items
+        for i in range(1, self.cb_presets.count()):
+            self.cb_presets.setItemText(i, self.cb_presets.itemData(i))
         name = self.cb_presets.itemData(combo_idx)
         if not name:
             self.settings.set_active_preset(None)
@@ -1542,133 +1988,113 @@ class MainWindow(QMainWindow):
         data = self.settings.load_preset(name)
         if data is None:
             return
-        self._preset_loading = True
-        try:
-            self._load_preset_data_to_ui(data)
-        finally:
-            self._preset_loading = False
+        self.settings.update(dict(data))
+        self._apply_values_to_ui(self.settings.get_all())
+        self._save_ui_to_settings()       # normalise anything the preset didn't contain
         self.settings.set_active_preset(name)
+        self._update_preset_dirty()
+        self._log_message(f"Загружен пресет «{name}».")
 
     def _action_save_preset(self):
-        """Save current settings as a new or existing preset."""
-        # Pre-fill with active preset name if one is selected
         current_name = self.cb_presets.currentData() or ""
-        name, ok = QInputDialog.getText(
-            self, "Сохранить пресет",
-            "Имя пресета:", text=current_name
-        )
+        name, ok = QInputDialog.getText(self, "Сохранить пресет",
+                                        "Название пресета:", text=current_name)
         if not ok or not name.strip():
             return
         name = name.strip()
+        if name != current_name and name in self.settings.get_preset_names():
+            reply = QMessageBox.question(self, "Пресет существует",
+                                         f"Пресет «{name}» уже есть. Перезаписать?")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self._save_ui_to_settings()
         self.settings.save_preset(name)
         self._refresh_presets_combo(select_name=name)
+        self._log_message(f"Пресет «{name}» сохранён.")
 
     def _action_rename_preset(self):
-        """Rename the currently selected preset."""
         old_name = self.cb_presets.currentData()
         if not old_name:
-            QMessageBox.warning(self, "Пресеты", "Сначала выберите пресет для переименования.")
+            QMessageBox.information(self, "Пресеты", "Сначала выберите пресет.")
             return
-        new_name, ok = QInputDialog.getText(
-            self, "Переименовать пресет",
-            "Новое имя:", text=old_name
-        )
-        if not ok or not new_name.strip():
+        new_name, ok = QInputDialog.getText(self, "Переименовать пресет", "Новое название:", text=old_name)
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
             return
         new_name = new_name.strip()
-        if new_name == old_name:
+        if new_name in self.settings.get_preset_names():
+            QMessageBox.warning(self, "Пресеты", f"Пресет «{new_name}» уже существует.")
             return
         self.settings.rename_preset(old_name, new_name)
         self._refresh_presets_combo(select_name=new_name)
 
     def _action_delete_preset(self):
-        """Delete the currently selected preset after confirmation."""
         name = self.cb_presets.currentData()
         if not name:
-            QMessageBox.warning(self, "Пресеты", "Сначала выберите пресет для удаления.")
+            QMessageBox.information(self, "Пресеты", "Сначала выберите пресет.")
             return
-        reply = QMessageBox.question(
-            self, "Удалить пресет",
-            f"Удалить пресет «{name}»?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        reply = QMessageBox.question(self, "Удалить пресет",
+                                     f"Удалить пресет «{name}»?\nТекущие настройки не изменятся.")
         if reply != QMessageBox.StandardButton.Yes:
             return
         self.settings.delete_preset(name)
         self._refresh_presets_combo()
 
-    def _load_preset_data_to_ui(self, data: dict):
-        """Apply a preset data dict to all UI widgets (without saving to settings file)."""
-        # Cut
-        dur = data.get("segment_duration_min", 16)
-        dur_map = {5: 0, 10: 1, 16: 2, 20: 3, 30: 4}
-        if dur in dur_map:
-            self.cb_duration.setCurrentIndex(dur_map[dur])
-            self.spin_duration.setValue(dur)
-        else:
-            self.cb_duration.setCurrentIndex(5)
-            self.spin_duration.setValue(dur)
-
-        # IO
-        self.chk_intro.setChecked(data.get("intro_enabled", False))
-        self.chk_outro.setChecked(data.get("outro_enabled", False))
-        self.lbl_intro_path.setText(data.get("intro_path", "") or "Путь не выбран")
-        self.lbl_outro_path.setText(data.get("outro_path", "") or "Путь не выбран")
-
-        # Logo
-        self.chk_logo.setChecked(data.get("logo_enabled", False))
-        self._logos_data = list(data.get("logos", []))
-        self._refresh_logos_list()
-
-        # Video
-        self.cb_res.setCurrentText(data.get("resolution", "source"))
-        self.spin_res_w.setValue(data.get("custom_resolution_w", 1920))
-        self.spin_res_h.setValue(data.get("custom_resolution_h", 1080))
-        self.cb_fps.setCurrentText(data.get("fps", "source"))
-        codec_val = data.get("codec", "libx264")
-        idx = self.cb_codec.findData(codec_val)
-        if idx >= 0:
-            self.cb_codec.setCurrentIndex(idx)
-
-        if "parallel_workers" in data:
-            w_idx = self.cb_workers.findData(data["parallel_workers"])
-            if w_idx >= 0:
-                self.cb_workers.setCurrentIndex(w_idx)
-
-        # Shorts
-        self.chk_shorts.setChecked(data.get("shorts_enabled", False))
-        self.cb_shorts_res.setCurrentText(data.get("shorts_resolution", "1080x1920"))
-        fit_idx = self.cb_shorts_fit.findData(data.get("shorts_fit", "blur_sides"))
-        self.cb_shorts_fit.setCurrentIndex(fit_idx if fit_idx >= 0 else 0)
-
-        # Sound overlay
-        self.chk_sound.setChecked(data.get("sound_overlay_enabled", False))
-        self._sounds_data = list(data.get("sound_overlays", []))
-        self._refresh_sounds_list()
-
-        # Persist loaded preset data into the main settings so processing picks it up
-        self.settings.update({k: v for k, v in data.items()})
-
-
-
     # ------------------------------------------------------------------
-    # Drag and Drop
+    # Drag and Drop / window events
     # ------------------------------------------------------------------
-    # To properly handle drag & drop we would override dragEnterEvent
-    # and dropEvent on the table or main window. For simplicity, we can
-    # leave it as a quick implementation if needed, but it's requested.
 
-    
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.accept()
+        if event.mimeData().hasUrls() and not self._running:
+            event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith(('.mp4', '.mkv', '.mov')):
-                self._add_file_to_queue(path)
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self._add_paths(paths)
+            event.acceptProposedAction()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initial_layout_done:
+            self._initial_layout_done = True
+            total = sum(self._v_split.sizes())
+            self._v_split.setSizes([max(200, total - 130), 130])
+
+    def closeEvent(self, event):
+        processing = self._running and self.queue_manager.isRunning()
+        uploading = bool(self._vk_uploader and self._vk_uploader.isRunning())
+        if processing or uploading:
+            what = "Идёт нарезка видео" if processing else "Идёт загрузка в ВК"
+            if processing and uploading:
+                what = "Идёт нарезка видео и загрузка в ВК"
+            reply = QMessageBox.question(
+                self, "Выход", f"{what}.\nОстановить и закрыть программу?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._stop_requested = True
+            try:
+                self.queue_manager.queue_completed.disconnect(self._on_queue_completed)
+            except (RuntimeError, TypeError):
+                pass
+            if processing:
+                self.queue_manager.cancel()
+            if uploading:
+                self._vk_uploader.cancel()
+                try:
+                    self._vk_uploader.finished_all.disconnect(self._on_vk_finished)
+                except (RuntimeError, TypeError):
+                    pass
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                if processing:
+                    self.queue_manager.wait(15000)
+                if uploading:
+                    self._vk_uploader.wait(5000)
+            finally:
+                QApplication.restoreOverrideCursor()
+        event.accept()

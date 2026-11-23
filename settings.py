@@ -7,6 +7,7 @@ Settings are stored in a JSON file next to the application.
 
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -75,7 +76,27 @@ class Settings:
                 config_path = Path(__file__).parent / "settings.json"
         self._path = Path(config_path)
         self._data: dict = copy.deepcopy(DEFAULT_SETTINGS)
+        # Program folder may be read-only (e.g. C:\Program Files) — then keep
+        # settings in the user's home folder instead.
+        if self.FALLBACK_PATH.exists():
+            self._path = self.FALLBACK_PATH
+        elif not self._is_writable(self._path):
+            self.load()                       # pick up the old file once (if any)
+            self._path = self.FALLBACK_PATH   # ...but write to the fallback
+            return
         self.load()
+
+    FALLBACK_PATH = Path.home() / ".stream_auto_cutter" / "settings.json"
+
+    @staticmethod
+    def _is_writable(path: Path) -> bool:
+        if path.exists():
+            return os.access(path, os.W_OK)
+        return os.access(path.parent, os.W_OK) if path.parent.exists() else False
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     # ------------------------------------------------------------------
     # Persistence
@@ -96,9 +117,15 @@ class Settings:
 
     def save(self) -> None:
         """Persist current settings to disk."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2, ensure_ascii=False)
+        for attempt in (self._path, self.FALLBACK_PATH):
+            try:
+                attempt.parent.mkdir(parents=True, exist_ok=True)
+                with open(attempt, "w", encoding="utf-8") as fh:
+                    json.dump(self._data, fh, indent=2, ensure_ascii=False)
+                self._path = attempt
+                return
+            except OSError:
+                continue
 
     # ------------------------------------------------------------------
     # Access

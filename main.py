@@ -20,6 +20,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gui import MainWindow
@@ -50,6 +51,12 @@ def main():
     
     # Initialize application
     app = QApplication(sys.argv)
+
+    # Russian texts for standard Qt buttons (OK / Cancel / Yes / No …)
+    translator = QTranslator(app)
+    if translator.load(QLocale("ru"), "qtbase", "_",
+                       QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+        app.installTranslator(translator)
     
     # Load settings from the same directory as main.py or executable
     if getattr(sys, 'frozen', False):
